@@ -1,0 +1,8 @@
+cbWatch0=MY_STATIONS
+cbWatch1=UDPmessage.data[14]
+cbWatch2=UDPmessage.data[13]
+cbWatch3=UDPmessage.data[12]
+cbWatch4=UDPmessage.data[11]
+cbWatch5=UDPmessage.data[10]
+cbWatch6=UDPmessage.data[9]
+cbWatch7=UDPmessage.data[8]

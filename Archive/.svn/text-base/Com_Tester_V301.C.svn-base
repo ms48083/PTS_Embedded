@@ -1,0 +1,1204 @@
+/*******************************************************************
+   REMOTE2.C   Colombo Semi-Automatic Pneumatic Tube Transfer System
+
+   Purpose:    Remote station control program.  Processes local i/o
+               and main_station control commands.
+
+   Target:     Z-World BL2500 Rabbit
+
+   Language:   Dynamic C v8.x
+
+   Created:    Jun 12, 2006 by Mike Schwedt (C) MS Technology Solutions
+
+   History:
+   12-Jun-06   v301 Original version created from RMOT235.c
+
+***************************************************************/
+#define FIRMWARE_VERSION "REMOTE V3.01"
+// define PRINT_ON for additional debug printing via printf
+// #define PRINT_ON 1
+#memmap xmem  // Required to reduce root memory usage
+#class auto
+#use "bl20xx.lib"          Controller library
+
+// RabbitNet RN1600 Setup
+//int DevRN1600;                    // Rabbit Net Device Number Keypad/LCD
+int DevRN1100;                   // Rabbit Net Device Number Digital I/O
+//configure to sinking safe state
+#define OUTCONFIG 0xFFFF
+
+// Setup interrupt handling for carrier arrival input
+// Set equal to 1 to use fast interrupt in I&D space
+#define FAST_INTERRUPT 0
+char latchCarrierArrival;
+void my_isr1();
+void arrivalEnable(char how);
+
+// Data structures
+struct iomessage     /* Communications command structure */
+{
+   char lplc;
+   char command;
+   char station;
+   char data[4];
+};
+
+char THIS_LPLC;         // board address for communications and setup
+char MY_STATIONS;       // to mask supported stations
+char IO_SHIFT;          // to map expansion board i/o
+char diverter_map[8];   // to assign diverter positions to stations
+
+// Global variables
+unsigned long thistime, lasttime, lost;
+
+/* Declare general function prototypes */
+void msDelay(unsigned int msec);
+char bit2station(char station_b);// station_b refers to bit equivalent: 0100
+char station2bit(char station);  // station refers to decimal value: 3 --^
+void init_counter(void);
+void process_local_io(void);
+void set_remote_io(char *remotedata);
+void init_io(void);
+void exercise_io(void);
+void clear_io(void);
+void send_response(struct iomessage message);
+char get_command(struct iomessage *message);
+void process_command(struct iomessage message);
+void enable_commands(void);
+void arrival_alert(char code, char station);
+char isMyStation(char station);
+void toggleLED(char LEDDev);
+void maintenance(void);
+char Timeout(unsigned long start_time, unsigned long duration);
+
+/* Declare local and expansion bus input prototypes */
+char carrierInChamber(char station_mask);
+char doorClosed(char station_mask);
+char carrierArrival(char station_mask);
+char requestToSend(char station_mask);
+char diverter_pos(void);
+
+/* Declare local and expansion bus output prototypes */
+char rts_latch;      /* Used for latching requestToSend */
+void inUse(char how, char station_b);
+void alert(char how, char station_b);
+void alarm(char how);
+void diverter(char how);
+void set_diverter(char station);
+void check_diverter(void);
+
+// Declare watchdog and powerlow handlers
+char watchdogCount(void);
+char powerlowCount(void);
+void incrementWDCount(void);
+void incrementPLCount(void);
+void loadResetCounters(void);
+
+// Digital I/O definitions
+// INPUTS
+int readDigInput(char channel);
+// dio_ON|OFF must be used ONLY in primatives readDigInput and setDigOutput
+// they reflect the real state of the logic inputs and outputs
+#define dio_ON  0
+#define dio_OFF 1
+#define di_carrierInChamber        0
+#define di_diverterPos             0
+#define di_carrierArrival          0
+#define di_remoteAddress           0
+#define di_requestToSend           0
+#define di_doorClosed              0
+
+// OUTPUTS
+void setDigOutput(int channel, int value);
+#define do_shift 0
+#define do_alert(which,value)      setDigOutput(8+do_shift+which,value)
+#define do_inUseLight(which,value) setDigOutput(12+do_shift+which,value)
+#define do_CICLight(which,value)   setDigOutput(16+do_shift+which,value)
+#define do_diverter(value)         setDigOutput(20+do_shift,value)
+#define DIVERTER_POWER_MASK  0x10
+#define do_alarm(value)            setDigOutput(21+do_shift,value)
+#define ALARM_MASK           0x20
+// #define beep(value)                rn_keyBuzzerAct(DevRN1600, value, 0)
+void inUse(char how, char station_b);
+void alarm(char how);
+
+/* "how" types & values and other constants */
+#define ON           0xFF
+#define OFF          0x00
+#define FLASH        0x01
+//#define TRUE         0xFF
+//#define FALSE        0x00
+#define aaRESET      0x00
+#define aaSET        0x01
+#define aaTEST       0x02
+#define ToREMOTE     0x01
+#define ToMAIN       0x02
+
+/* Serial communications send and receive commands */
+#define NAK 0x15
+#define ACK 0x06
+#define STX 0x02
+#define ETX 0x03
+#define DINBUFSIZE 31
+#define DOUTBUFSIZE 31
+#define SET_DIVERTER       'A'
+#define DIVERTER_STATUS    'B'
+#define DIVERTER_READY     'C'
+#define DIVERTER_NOT_READY 'D'
+#define RETURN_INPUTS      'E'
+#define INPUTS_ARE         'E'
+#define SET_OUTPUTS        'G'
+#define CLEAR_OUTPUTS      'H'
+#define SET_OPMODE         'I'
+#define ARE_YOU_READY      'J'
+#define RETURN_EXTENDED    'K'
+#define TRANS_COMPLETE     'X'
+#define RESET              'Y'
+#define MALFUNCTION        'Z'
+
+/* Declare miscellaneous timeouts */
+#define DIVERTER_TIMEOUT  30000        // How long to set diverter
+                   // May be longer than mainsta timeout
+/******************************************************************/
+unsigned long diverter_start_time;     // these used primarily by diverter functions
+char diverter_setting;
+char diverter_attention;
+char arrival_from;          // indicates if main is ready for receive
+
+/* Array index values for remote data, returned by INPUTS_ARE command. */
+#define REMOTE_CIC      0
+#define REMOTE_DOOR     1
+#define REMOTE_ARRIVE   2
+#define REMOTE_RTS      3
+
+/* Declare on-board high powered outputs (UCN 5841A)*/
+//char hv_outval;
+//#define DIVERTER_ON     0x80
+//#define DOOR_ALERT_MASK 0x0F
+
+/* Declare on-board optically isolated inputs (NEC 2506-4)*/
+//#define DIVERTER_POS 0x0F
+
+// Declare power low interrupt handler
+//#if ROM==1
+//#JUMP_VEC NMI_VEC power_low_handler
+//#endif
+// next "ret" should be "retn"
+/*
+interrupt retn power_low_handler()
+{
+    // Increment the power low counter
+    //outport(ITC,(inport(ITC))&~0x02);       // disable INT1 (for testing in RAM)
+    incrementPLCount();
+    // Go into standby
+    // Either the power will restore and we continue
+    // Or power drops and system resets
+//    for(;;) if (!powerlo()) return;
+    for(;;);  // try infinite loop, never return
+    //outport(ITC,(inport(ITC))|0x02);      // enable  INT1 (for testing in RAM)
+}
+nodebug void loadnmivec(void);
+nodebug void loadnmivec()
+{  // setup for power-low interrupt
+#if ROM==0
+   // this section for testing in RAM (development/debug) mode
+   // this stuff according to Z-World tech support
+   // addr 0x2018 is for INT1 attention /AT of the PLCBus
+   *((int*)(0x2018)) = (int)power_low_handler;  // reload isr vector for RAM
+
+   // next line only for testing
+   outport(ITC,(inport(ITC))|0x02);      // enable  INT1
+   //outport(ITC,(inport(ITC))&~0x02);       // disable INT1
+#endif
+}
+*/
+void processCycleTime()
+{  // calculate and display cycle time statistics
+#define CYCLETIME_UPDATE 2000
+   static int ct_min, ct_avg, ct_max;
+   static int ct_loops;
+   static unsigned long cycle_start;
+   static unsigned long ct_last;
+   unsigned long cycle_time;
+
+   if (MS_TIMER - cycle_start >= CYCLETIME_UPDATE)
+   {  if (ct_loops > 0) ct_avg = (int)((MS_TIMER - cycle_start) / ct_loops);
+      printf("\n n=%d min=%d avg=%d max=%d", ct_loops, ct_min, ct_avg, ct_max);
+      ct_max=0;
+      ct_min=32767;
+      ct_loops=0;
+      cycle_start=MS_TIMER;
+   }
+   else
+   {
+      cycle_time = MS_TIMER - ct_last;
+      ct_loops = ct_loops + 1;
+      if (cycle_time > ct_max) ct_max = (int)cycle_time;
+      if (cycle_time < ct_min) ct_min = (int)cycle_time;
+   }
+   ct_last = MS_TIMER;
+}
+
+main()
+{  int i;
+   unsigned long timeout;
+   struct iomessage message;
+   char key, simonsays;
+   //auto rn_search newdev;
+   int status;
+
+   /* Initialize Programmable Reload Timer */
+   //init_counter();
+   //loadnmivec();  // load interrupt vector service for powerlow IN RAM ONLY
+
+   /* Initialize i/o */
+   //loadResetCounters();  // load counters for watchdog and powerlow resets
+   // Initialize the controller
+   brdInit();              // Initialize the controller
+
+   hitwd();
+   init_io();
+   arrival_alert(aaRESET, 0);
+   /* read board address and set configuration i/o mappings */
+   THIS_LPLC = (di_remoteAddress);
+   THIS_LPLC = 1;
+   printf("\nThis is remote plc # %d\n", THIS_LPLC);
+
+   // flash the plc number
+   //flasher(0);
+   for (i=0; i<THIS_LPLC; i++)
+   {  msDelay(200);
+      ledOut(0,1);
+      msDelay(150);
+	   ledOut(0,0);
+      hitwd();
+   }
+   // if (PRINT_ON) printf("\nWD and PL Reset Counters %d  %d", watchdogCount(), powerlowCount());
+   exercise_io();
+
+   // Set the diverter mapping based on the Remote ID#
+   // Entry in diverter_map is the binary diverter port number (1,2,4,8)
+   switch (THIS_LPLC)
+   {
+      case 0:
+         break;
+      case 1:
+         MY_STATIONS = 0x0F;     // mask for stations used by this lplc
+         IO_SHIFT = 0;           // 4 for stations 5-7, 0 for stations 1-3
+         diverter_map[0] = 0; diverter_map[1] = 1;
+         diverter_map[2] = 2; diverter_map[3] = 4;
+         diverter_map[4] = 8; diverter_map[5] = 0;
+         diverter_map[6] = 0; diverter_map[7] = 0;
+         break;
+      case 2:
+         MY_STATIONS = 0x70;     // mask for stations used by this lplc
+         IO_SHIFT = 4;           // 4 for stations 5-7, 0 for stations 1-3
+         diverter_map[0] = 0; diverter_map[1] = 1;
+         diverter_map[2] = 1; diverter_map[3] = 1;
+         diverter_map[4] = 1; diverter_map[5] = 2;
+         diverter_map[6] = 4; diverter_map[7] = 8;
+         break;
+      case 3:
+         MY_STATIONS = 0x03;     // mask for stations used by this lplc
+         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
+         diverter_map[0] = 0; diverter_map[1] = 1;
+         diverter_map[2] = 2; diverter_map[3] = 4;
+         diverter_map[4] = 4; diverter_map[5] = 8;
+         diverter_map[6] = 8; diverter_map[7] = 8;
+         break;
+      case 4:
+         MY_STATIONS = 0x0C;     // mask for stations used by this lplc
+         IO_SHIFT = 2;           // maps i/o 1-4 to stations x-x
+         diverter_map[0] = 0; diverter_map[1] = 0;
+         diverter_map[2] = 0; diverter_map[3] = 1;
+         diverter_map[4] = 2; diverter_map[5] = 0;
+         diverter_map[6] = 0; diverter_map[7] = 0;
+         break;
+      case 5:
+         MY_STATIONS = 0x70;     // mask for stations used by this lplc
+         IO_SHIFT = 4;           // maps i/o 1-4 to stations x-x
+         diverter_map[0] = 0; diverter_map[1] = 0;
+         diverter_map[2] = 0; diverter_map[3] = 0;
+         diverter_map[4] = 0; diverter_map[5] = 1;
+         diverter_map[6] = 2; diverter_map[7] = 4;
+         break;
+      case 6:
+         MY_STATIONS = 0x01;     // mask for stations used by this lplc
+         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
+         diverter_map[0] = 0; diverter_map[1] = 1;
+         diverter_map[2] = 2; diverter_map[3] = 2;
+         diverter_map[4] = 2; diverter_map[5] = 2;
+         diverter_map[6] = 2; diverter_map[7] = 2;
+         break;
+      case 7:
+         MY_STATIONS = 0x02;     // mask for stations used by this lplc
+         IO_SHIFT = 1;           // maps i/o 1-4 to stations x-x
+         diverter_map[0] = 0; diverter_map[1] = 0;
+         diverter_map[2] = 1; diverter_map[3] = 2;
+         diverter_map[4] = 2; diverter_map[5] = 2;
+         diverter_map[6] = 2; diverter_map[7] = 2;
+         break;
+   }
+
+   /* Initialize display */
+   //if (PRINT_ON) printf("\x1bT");
+   //if (PRINT_ON) printf("Diverter pos is %d  ",diverter_pos());
+   //if (PRINT_ON) printf("Press <F4> then any other key to end.");
+
+   /* Initialize serial port 1 */
+   //ser_init_z1(4, BAUD_RATE/1200);
+   enable_commands();
+
+   thistime=MS_TIMER;
+   lost=0;
+
+   simonsays=TRUE;
+   while(simonsays)
+   {
+processCycleTime();
+      // setup to test WD reset
+      // hold I4 active to generate infinite loop leading to WD reset
+      //while (~inport(PIODA) & 0x10);
+
+      /* hit the watchdog timer */
+      //hitwd();
+      /* flash the led */
+      //showactivity();
+		maintenance();  // Hit WD, flash LEDs, write outputs
+
+      /* check for and process incoming commands */
+      if (get_command(&message)) process_command(message);
+
+      /* check for and process local inputs */
+      process_local_io();
+      arrival_alert(aaTEST, 0);
+
+   } /* end while */
+}
+/********************************************************/
+char trans_station, diverter_station;
+char carrier_attn;
+//char remote_stat_alert;
+//unsigned long arrival_time;
+/********************************************************/
+void arrivalEnable(char how)
+{
+   // should call this routine once to enable interrupt and once to disable
+
+   latchCarrierArrival=FALSE;    // clear existing latch
+   if (how)
+   {   //outport(ITC,(inport(ITC))|0x02);      // enable  INT1
+   	//WrPortI(I1CR, &I1CRShadow, 0x09);		// enable external INT1 on PE1, rising edge, priority 1
+   } else
+   {   //outport(ITC,(inport(ITC))&~0x02);     // disable INT1
+   	//WrPortI(I1CR, &I1CRShadow, 0x00);		// disble external INT1 on PE1
+   }
+}
+void init_io()
+{
+   clear_io();
+   rts_latch=0;
+   trans_station=0;
+   diverter_station=0;
+   carrier_attn=0;
+   //arrival_time=0;
+   arrival_from=0;
+   alarm(OFF);
+	latchCarrierArrival=FALSE;
+}
+void exercise_io()
+{
+//   if (!wderror())
+//   {
+      alert(ON, MY_STATIONS);
+      inUse(FLASH, MY_STATIONS);
+      hitwd();       // hit the watchdog
+      msDelay(1000);
+      hitwd();       // hit the watchdog
+      msDelay(1000);
+      inUse(ON, MY_STATIONS); msDelay(200);
+      hitwd();       // hit the watchdog
+      inUse(OFF, MY_STATIONS); alert(OFF, MY_STATIONS); msDelay(200);
+      inUse(ON, MY_STATIONS);  alert(ON, MY_STATIONS);  msDelay(200);
+//   }
+   inUse(OFF, MY_STATIONS);
+   alert(OFF, MY_STATIONS);
+   hitwd();       // hit the watchdog
+
+}
+/********************************************************/
+void process_local_io()
+{
+   char rts_data, cic_data;  /* bitwise station bytes */
+   char door_data;
+   char on_bits, flash_bits;  /* which ones on and flash */
+   char s, sb;                /* work vars for station & stationbit */
+
+   /* Check for diverter attention */
+   check_diverter();
+
+   /* If request to send and carrier in chamber flash in_use. */
+   rts_data=requestToSend(MY_STATIONS);
+   cic_data=carrierInChamber(MY_STATIONS);
+   door_data=doorClosed(MY_STATIONS);
+
+   /* Latch request_to_send for new requests */
+   rts_latch |= (rts_data & cic_data & door_data) & ~carrier_attn;
+
+   /* 27-May-04, Remote v2.34 */
+   /* Don't latch requests from station in current transaction */
+   rts_latch &= ~station2bit(trans_station);
+
+   /* Turn off those who have lost their carrier or opened door */
+   rts_latch &= cic_data;
+   rts_latch &= door_data;
+
+   //on_bits    = rts_data | station2bit(trans_station);
+   //flash_bits = rts_latch & ~rts_data;
+   on_bits    = station2bit(trans_station);
+   flash_bits = rts_latch | rts_data | station2bit(diverter_station);
+
+   /* flash the in-use light at the station requiring attention */
+   if (carrier_attn) flash_bits |= carrier_attn;
+
+   // if main arrival active, flash inuse at who sent to main
+   if (arrival_from)
+   {  on_bits &= ~arrival_from;
+      flash_bits |= arrival_from;
+   }
+
+   // set the in use lights as necessary
+   inUse(OFF, ~on_bits & ~flash_bits & MY_STATIONS & ~station2bit(trans_station));
+   inUse(ON, on_bits);
+   inUse(FLASH, flash_bits & ~station2bit(trans_station));
+
+//FUTURE
+// if a door opens that is the trans_station, signal by alert
+// currently sent by set_outputs from main.
+
+
+}
+
+/********************************************************/
+void process_command(struct iomessage message)
+{
+   char wcmd, wdata;
+   char ok;
+   struct iomessage response;
+   response.command=0;
+   response.station=message.station;   // set initial default
+
+   /* determine what type of command */
+   switch(message.command)
+   {
+      case ARE_YOU_READY:
+	      // enable arrival interrupt / latch
+	      arrivalEnable(TRUE);
+         response.command=ARE_YOU_READY;
+	      if (isMyStation(message.station))
+	      {
+	         rts_latch &= ~station2bit(message.station); // clear latch
+	         /* only if door closed, and (CIC or send-to-here) */
+	         if  ( doorClosed(station2bit(message.station))
+	          && ( carrierInChamber(station2bit(message.station)) || message.data[0]==0) )
+	         {  response.data[0]=MY_STATIONS;           // ready
+	            inUse(ON, station2bit(message.station));
+	            trans_station=message.station;
+	         }
+	         else
+	         {  response.data[0]=0;                     // not ready
+	            inUse(OFF, station2bit(message.station));
+	            alert(ON, station2bit(message.station));
+	         }
+	      } else
+	      { response.data[0]=MY_STATIONS;  // ready - not my station
+	        trans_station=message.station;
+	      }
+         break;
+
+      case SET_DIVERTER:
+         // took out clear of rts_latch 2/1/96 ... not sure if needed
+         //rts_latch &= ~station2bit(message.station); // clear latch
+         inUse(FLASH, station2bit(message.station));
+         set_diverter(message.station);
+
+         // check for alert during stat-delivery
+//         if (message.data[1]==1)
+//         {  remote_stat_alert=message.station;
+//            arrival_alert(aaSET, message.station);
+//         } else
+//         {  remote_stat_alert=0;
+//         }
+
+         break;
+
+      case DIVERTER_STATUS:      /* return logic of correct position */
+         response.command=DIVERTER_STATUS;
+         if ( (diverter_pos() == diverter_map[message.station])
+             || (diverter_map[message.station]==0) )
+         {  response.data[0]=MY_STATIONS; // DIVERTER_READY;
+         } else
+         { response.data[0]=0;            // DIVERTER_NOT_READY;
+         }
+         break;
+
+      case RETURN_INPUTS:        /* return general status */
+         // main includes some status info here ... pull it out
+         arrival_from=message.data[0];
+
+         response.command=INPUTS_ARE;
+         response.station=MY_STATIONS;  // return this to enlighten main
+         response.data[REMOTE_CIC]=carrierInChamber(MY_STATIONS);
+         response.data[REMOTE_DOOR]=doorClosed(MY_STATIONS);
+         response.data[REMOTE_ARRIVE]=carrierArrival(MY_STATIONS);
+         //response.data[REMOTE_RTS]=requestToSend(MY_STATIONS);
+         response.data[REMOTE_RTS]=rts_latch;
+         break;
+
+      case RETURN_EXTENDED:     /* return extended data */
+          // return watchdog and powerlow counters
+         response.command=RETURN_EXTENDED;
+         response.data[0]=watchdogCount();
+         response.data[1]=powerlowCount();
+         break;
+
+      case SET_OUTPUTS:
+         /* set outputs from mainsta */
+         set_remote_io(&message.data[0]);
+         break;
+
+      case CLEAR_OUTPUTS:
+         break;
+
+      case SET_OPMODE:
+         break;
+
+      case TRANS_COMPLETE:
+         alert(OFF, station2bit(message.station));
+		   arrivalEnable(FALSE);  // Disable arrival interrupt
+         //arrival_time=MS_TIMER;
+         trans_station=0;
+//         remote_stat_alert=0;
+         // set arrival alert if the transaction is to here
+         if (message.data[0] == ToREMOTE && isMyStation(message.station))
+         {  if (message.data[1]==1)  // and Main says to set arrival alert
+            { // OK to set alert
+               inUse(FLASH, station2bit(message.station));  // until no cic
+               carrier_attn |= station2bit(message.station);  // to flash inuse
+               arrival_alert(aaSET, message.station);
+            }
+         }
+         break;
+
+      case MALFUNCTION:  // may be contributing to funky flashing
+         // turn on alarm output only
+         inUse(OFF, MY_STATIONS);           // clear local i/o
+         alert(OFF, MY_STATIONS);
+         alarm(ON);
+		   arrivalEnable(FALSE);  // Disable arrival interrupt
+         rts_latch=0;
+         trans_station=0;
+         diverter_station=0;
+         response.data[0]=0;                 // clear remote i/o
+         response.data[1]=0;
+         response.data[2]=0;
+         response.data[3]=0;
+         set_remote_io(&response.data[0]);
+         arrival_alert(aaRESET, 0);
+         break;
+
+      case RESET:
+         // Turn off all outputs
+         inUse(OFF, MY_STATIONS);           // clear local i/o
+         alert(OFF, MY_STATIONS);
+         alarm(OFF);
+		   arrivalEnable(FALSE);  // Disable arrival interrupt
+         /// rts_latch=0;  Try to not clear latch on reset
+         trans_station=0;
+         diverter_station=0;
+         response.data[0]=0;                 // clear remote i/o
+         response.data[1]=0;
+         response.data[2]=0;
+         response.data[3]=0;
+         set_remote_io(&response.data[0]);
+         arrival_alert(aaRESET, 0);
+         break;
+   }
+
+   /* send the response message if any AND the query was only to me */
+   if (response.command && (message.lplc==THIS_LPLC))
+   {
+      response.lplc=THIS_LPLC;
+      send_response(response);
+   }
+   //enable_commands();
+   return;
+}
+
+unsigned long alert_timer[8];   // for stations 1..7     ...  [0] is not used.
+void arrival_alert(char func, char station)
+{
+   int i;
+
+   switch (func)
+   {
+      case aaRESET:
+       for (i=1; i<=7; i++)
+       {
+          alert_timer[i]=0;
+          alert(OFF, station2bit(i));
+       }
+       break;
+
+      case aaSET:
+       if (station>=1 && station<=7)       // make sure s# is correct
+       {
+          alert_timer[ station ] = SEC_TIMER;
+       }
+       break;
+
+      case aaTEST:
+       for (i=1; i<=7; i++)     // Check each station
+       {
+          if (alert_timer[i])
+          {
+             if ( carrierInChamber( station2bit(i) ))    // || (remote_stat_alert==i) )
+             {
+               // Flash as necessary
+               if ( (SEC_TIMER - alert_timer[i]) %20 >= 10 )
+                 alert(ON, station2bit(i));
+               else
+                 alert(OFF, station2bit(i));
+             }
+             //else if (clock() = alert_timer[i] > 1)
+             else if (!doorClosed( station2bit(i) ) || i==trans_station)
+             {  // no carrier, door open
+               // or no carrier, in transit --> reset
+               alert_timer[i]=0;
+               alert(OFF, station2bit(i));
+               carrier_attn &= ~station2bit(i); // clear attn flag
+
+             }
+          } else carrier_attn &= ~station2bit(i); // no timer, so no flag
+
+       }
+       break;
+   }
+}
+
+/************************************************************/
+/**************     DIGITAL I/O     *************************/
+/************************************************************/
+char outputvalue [4];
+char remoteoutput [4];
+char outval;                            // work space
+
+#define devIUS   0
+#define devIUF   1
+#define devAlert 2
+#define devAlarm 3
+
+int readDigInput(char channel)
+{  // returns the state of digital input 0-39
+   // function supports inverted logic by assigning dio_ON and dio_OFF
+
+   char rtnval;
+
+   if (channel < 16)
+   {  // on-board inputs
+      rtnval = digIn(channel);
+   }
+   else
+   {  // rn1100 inputs
+//      if (DevRN1100 != -1)
+//         rn_digIn(DevRN1100, channel-16, &rtnval, 0);
+   }
+   // deal with logic inversion
+   if (rtnval) rtnval = dio_ON;
+   else        rtnval = dio_OFF;
+   return rtnval;
+}
+
+void setDigOutput(int channel, int value)
+{  // sets the state of digital output 0-23
+   // call with logic value (0=OFF, 1=ON)
+   // function is adapted to support inverted logic by assigning dio_ON and dio_OFF
+
+   int outval;
+   // check for logic inversion
+   if (value) outval = dio_ON;
+   else       outval = dio_OFF;
+
+   if (channel < 8)
+   {  // on-board outputs
+      digOut(channel, outval);
+   }
+   else
+   {  // rn1100 outputs
+//      if (DevRN1100 != -1)
+//         rn_digOut(DevRN1100, channel-8, outval, 0);
+   }
+}
+
+void clear_io()
+{
+   char i;
+   for (i=0; i<4; i++)          // four output ports
+   {
+      outputvalue[i] = 0;
+      remoteoutput[i] = 0;
+   }
+}
+/*************************************************************/
+void set_remote_io(char *remotedata)
+{
+   /* save state of remote output request */
+   remoteoutput[0]=remotedata[0];
+   remoteoutput[1]=remotedata[1];
+//   remoteoutput[2]=remotedata[2];  // THIS IS devAlert - DON'T TAKE FROM MAIN
+   remoteoutput[3]=remotedata[3];
+
+   /* write out all outputs .. some may need to be shifted */
+//   write4data(addrIUS, outputvalue[devIUS] | remoteoutput[devIUS]);
+//   write4data(addrIUF, outputvalue[devIUF] | remoteoutput[devIUF]);
+//   outval = ((outputvalue[devAlert] | remoteoutput[devAlert]) >> IO_SHIFT);
+//   write4data(addrALT, outval);
+//   write4data(addrALM, outputvalue[devAlarm] | remoteoutput[devAlarm]);
+
+   // Write remotedata[devAlert] to output ports O5-O8
+//   hv_outval &= ~DOOR_ALERT_MASK;    // turn off door alert bits
+//   hv_outval = (remotedata[devAlert] & MY_STATIONS) >> IO_SHIFT;
+//   hv_wr(hv_outval);
+
+}
+/******************************************************************/
+char carrierInChamber(char stamask)
+{  return (di_carrierInChamber << IO_SHIFT) & stamask; }
+/******************************************************************/
+char doorClosed(char stamask)
+{  // Note: input is normally high on closed.
+   char indata;
+   //rn_digBankIn(DevRN1100,1, &indata, 0);
+   indata = indata >> 4;  // input port specific
+   return ((indata << IO_SHIFT) & stamask);
+}
+/******************************************************************/
+char carrierArrival(char stamask)
+{  return (di_carrierArrival << IO_SHIFT) & stamask; }
+
+/******************************************************************/
+char requestToSend(char stamask)
+{
+   char indata;
+   //rn_digBankIn(DevRN1100,1, &indata, 0);
+   return ((~indata << IO_SHIFT) & stamask);
+}
+/******************************************************************/
+void inUse(char how, char station_b)
+{
+   if (how == ON)
+   {  /* solid on, flash off */
+      outputvalue[devIUS] |= station_b;
+      outputvalue[devIUF] &= ~station_b;
+   }
+
+   if (how == OFF)
+   {  /* solid off, flash off */
+      outputvalue[devIUS] &= ~station_b;
+      outputvalue[devIUF] &= ~station_b;
+   }
+
+   if (how == FLASH)
+   {  /* solid off, flash on */
+      outputvalue[devIUS] &= ~station_b;
+      outputvalue[devIUF] |= station_b;
+   }
+
+   return;
+}
+/******************************************************************/
+void alert(char how, char station_b)
+{
+   if (how == ON) outputvalue[devAlert] |= station_b;
+   if (how == OFF) outputvalue[devAlert] &= ~station_b;
+
+   //outval = ((outputvalue[devAlert] | remoteoutput[devAlert]) >> IO_SHIFT);
+   //write4data(addrALT, outval);
+   //do_alert(outval, how);
+   // OUTPUTS WRITTEN IN SYSTEM LOOP CALL TO updateOutputs();
+
+   return;
+}
+/******************************************************************/
+void alarm(char how)
+{
+   // outputvalue is checked in the inUse function to turn alarm on/off
+   outputvalue[devAlarm] = how;
+
+   return;
+}
+/******************************************************************/
+char diverter_pos()
+{
+   return di_diverterPos;
+}
+
+/******************************************************************/
+char diverterPower;
+void diverter(char how)
+{  /* Controls the on/off state of the diverter drive mechanism */
+
+	diverterPower = how;
+   //if (how==ON)  hv_outval |= DIVERTER_ON;   /* turn on */
+   //else          hv_outval &= ~DIVERTER_ON;  /* turn off */
+   //hv_wr(hv_outval);
+
+   return;
+}
+/******************************************************************/
+void set_diverter(char station)
+{  /* Controls the setting of diverter positions
+      Return from this routine is immediate.  If diverter is not
+      in position, it is turned on and a timer started.
+
+      You MUST repeatedly call check_diverter() to complete processing
+      of the diverter control position
+   */
+
+   /* use mapping from station to diverter position */
+
+   if ((station>0) && (station<9))     // Valid station #
+   {
+      diverter_setting = diverter_map[station];    // mapped setting
+
+      // if position<>ANY (any=0) and not in position
+      if ((diverter_setting>0) && (diverter_setting!=diverter_pos()))
+      {
+    /* turn on diverter and start timer */
+    diverter(ON);
+
+    diverter_start_time = MS_TIMER;
+    diverter_attention = TRUE;
+    diverter_station=station;
+      }
+   }
+   return;
+}
+/******************************************************************/
+void check_diverter()
+{  /* Poll type processing of diverter control system */
+   /* Allows other processes to be acknowleged when setting diverter */
+
+   if (diverter_attention)
+   {
+      if ((diverter_setting == diverter_pos()) || Timeout(diverter_start_time, DIVERTER_TIMEOUT))
+      {
+	      // turn off diverter and clear status
+	      diverter(OFF);
+	      diverter_attention = FALSE;
+	      diverter_station=0;
+      }
+   }
+}
+void showactivity()
+{
+   // update active processor signal
+   //ledOut(0, (MS_TIMER %500) < 250);  // on fixed frequency
+   ledOut(1, (MS_TIMER %500) > 250);  // off fixed frequency
+   toggleLED(2);                      // toggle each call
+}
+void toggleLED(char LEDDev)
+{
+   static char LEDState[4];
+
+   // if LEDDev not 0..3 then initialize LED states off
+   if (LEDDev > 3)
+   {  LEDState[0]=0; LEDState[1]=0; LEDState[2]=0; LEDState[3]=0;
+   }
+   else
+   {
+      LEDState[LEDDev] ^= 1;               // toggle LED state on/off
+      ledOut(LEDDev, LEDState[LEDDev]);    // send LED state
+   }
+}
+
+void maintenance(void)
+{  // handle all regularly scheduled calls
+
+	static char out_alert, out_inuse, outval;
+
+   hitwd();                // hit the watchdog timer
+   showactivity();
+   //rn_keyProcess(DevRN1600, 0);  // process keypad device
+
+   // process command communications
+   //tcp_tick(NULL);
+   //receive_command();
+
+   // process flashing inUse lights
+   outval = 0;
+   out_alert = ((outputvalue[devAlert] | remoteoutput[devAlert]) >> IO_SHIFT);
+   // flash on
+   if ((MS_TIMER %1000) < 300) out_inuse = (outputvalue[devIUF] | outputvalue[devIUS]) >> IO_SHIFT;
+   // or flash off
+   else out_inuse = outputvalue[devIUS] >> IO_SHIFT;
+   // Write out alerts and inUse light
+   outval = out_alert | (out_inuse << 4);
+   if (dio_ON==0) outval = ~outval;
+//   rn_digBankOut(DevRN1100, 1, outval, 0);
+
+   // Process carrier in chamber and other outputs
+   outval = di_carrierInChamber;
+   if (diverterPower) outval |= DIVERTER_POWER_MASK;
+   if (outputvalue[devAlarm]) outval |= ALARM_MASK;
+   if (dio_ON==0) outval = ~outval;
+//   rn_digBankOut(DevRN1100, 2, outval, 0);
+
+}
+
+/********************************************************
+   Communication I/O drivers
+*********************************************************/
+/* Initialize buffers and counters */
+#define BAUD_RATE 19200
+#define CMD_LENGTH   10
+#define RCV_TIMEOUT  1
+#define rbuflen      30
+#define sbuflen      50
+char rbuf[rbuflen], sbuf[sbuflen];
+char rcc, bufstart;
+
+void disable485whenDone(void)
+{
+   while (serDwrUsed());          // wait for all bytes to be transmitted
+   while (RdPortI(SDSR) & 0x0C);  // wait for last byte to complete
+   serDrdFlush();                 // flush the read buffer
+   ser485Rx();                    // disable transmitter
+}
+/********************************************************/
+void enable_commands()
+{  // open serial port D
+   serDopen(BAUD_RATE);
+	/* enable the receiver to get cmdlen characters */
+	ser485Rx();
+   serDrdFlush(); // flush the read buffer
+//   while ((inport(STAT1) & 1)==1);  /* wait for send to complete */
+//   msDelay(2);
+   //ser_kill_z1();             /* stop any leftover input/output */
+//   ser_init_z1(4, BAUD_RATE/1200);
+//   rcc=rbuflen;               /* reset input buffer */
+//   bufstart=0;
+//   ser_rec_z1(rbuf, &rcc);    /* enable receiver interrupt */
+}
+/********************************************************/
+void send_response(struct iomessage message)
+{  /* Transmits a message/command to the main system.
+      Command string defined as:
+      <STX> <lplc> <Command> <Station> <Data0..3> <ETX> <CHKSUM> */
+
+   char i;
+   char cmdstr[CMD_LENGTH];
+   char cmdlen;
+   char rcvbuf[CMD_LENGTH];
+   char rcvlen;
+   unsigned long timeout, cmdsent;
+   cmdlen=CMD_LENGTH;
+
+   /* disable receiver */
+   //ser_kill_z1();
+   // ser_init_z1(4, BAUD_RATE/1200);
+
+   /* formulate the full command string */
+   cmdstr[0] = STX;
+   cmdstr[1] = THIS_LPLC;
+   cmdstr[2] = message.command;
+   cmdstr[3] = message.station;
+   cmdstr[4] = message.data[0];
+   cmdstr[5] = message.data[1];
+   cmdstr[6] = message.data[2];
+   cmdstr[7] = message.data[3];
+   cmdstr[8] = ETX;
+   cmdstr[CMD_LENGTH-1] = 0;
+   for (i=0; i<CMD_LENGTH-1; i++)
+      cmdstr[CMD_LENGTH-1] += cmdstr[i];  /* calculate checksum */
+
+/*if (PRINT_ON) printf("Sending response %d bytes ",cmdlen);*/
+
+   //rcvlen=CMD_LENGTH;  // enable receiver to find out when xmit is done
+   //ser_rec_z1(rcvbuf, &rcvlen);
+
+   // enable transmitter and send
+   ser485Tx();
+   //ser_send_z1(cmdstr, &cmdlen);
+   cmdlen = serDwrite(cmdstr, CMD_LENGTH);
+   //if (cmdlen != CMD_LENGTH) printf("Send command failed, only sent %d chars \n", cmdlen);
+
+   disable485whenDone();
+   printf("%ld Sent response\n", MS_TIMER);
+
+}
+
+/********************************************************/
+char get_command(struct iomessage *message)
+{
+/* Repeatedly call this function to process incoming commands
+   efficiently.
+*/
+   char charsinbuf, worklen, msg_address;
+   char rtnval, chksum, i;
+
+   charsinbuf = 0; // rbuflen-rcc;
+   worklen = charsinbuf-bufstart;
+   rtnval=FALSE;     /* assume none for now */
+
+   // align frame to <STX>
+   while ((serDrdUsed() > 0) && (serDpeek() != STX)) printf("%ld tossing %d\n",MS_TIMER, serDgetc());
+
+   // if at least 1 command in buffer then get them
+   if (serDrdUsed() >= CMD_LENGTH)
+	   charsinbuf = serDread(rbuf, CMD_LENGTH, RCV_TIMEOUT);
+
+   bufstart = 0;
+   //if (charsinbuf) printf("%d Characters in buffer\n", charsinbuf);
+   if (charsinbuf==CMD_LENGTH)  /* all characters received */
+   {
+	   /* verify STX, ETX, checksum then respond */
+	   if ((rbuf[bufstart] == STX) && (rbuf[bufstart+CMD_LENGTH-2] == ETX))
+	   {
+	      /* check checksum */
+	      chksum=0;
+	      for (i=0; i<CMD_LENGTH-1; i++) chksum+=rbuf[bufstart+i];
+
+	      if (chksum != rbuf[bufstart+CMD_LENGTH-1])
+	      {
+//         printf(" checksum bad");
+	         sbuf[0]=NAK;
+	         rtnval=FALSE;
+	      }
+	      else
+	      {
+	         /* looks good, send ACK */
+//         printf("%ld checksum good", MS_TIMER);
+	         sbuf[0]=ACK;
+	         rtnval=TRUE;
+	      }
+	      msg_address = rbuf[bufstart+1];
+//   		printf(" destined for %d", msg_address);
+	      // send response if message is addressed to me only
+	      if (msg_address==THIS_LPLC)
+         {
+	         // enable transmitter and send
+//         printf(" therfore ACK(NAK)");
+	         ser485Tx();
+         	serDwrite(sbuf, 1);
+			   disable485whenDone();
+         }
+
+	      // If this message for me OR everyone then process it.
+	      if ((msg_address==THIS_LPLC) || (msg_address & 0x80))
+	      {  // message for me (and possibly others)
+	         /* return the command for processing */
+	         message->lplc=msg_address;
+	         message->command=rbuf[bufstart+2];
+	         message->station=rbuf[bufstart+3];
+	         message->data[0]=rbuf[bufstart+4];
+	         message->data[1]=rbuf[bufstart+5];
+	         message->data[2]=rbuf[bufstart+6];
+	         message->data[3]=rbuf[bufstart+7];
+//printf(" got command %c", message->command);
+	      } else rtnval=FALSE;  // command not for me!
+//printf("\n");
+	      /* reset receiver ??*/
+         serDrdFlush(); // flush the read buffer
+	      // enable_commands();
+	   }
+   }
+   return rtnval;
+}
+/******************************************************************/
+char isMyStation(char station)
+{       return (station2bit(station) & MY_STATIONS);
+}
+/******************************************************************/
+char station2bit(char station)
+{  /* Converts the station number assignment to an equivalent
+      bit value.  ie. station 3 -> 0100 (=4) .. same as 2^(sta-1)
+      NOTE: Returns 0 if station is not 1..8  */
+
+   if (station) return 1 << (station-1);
+   return 0;
+}
+/******************************************************************/
+char bit2station(char station_b)
+{  /* Converts a bit assignment to the bit number value
+      ie. 0100 -> station 3.
+NOTE: Returns 0 if more than 1 station bit is active */
+
+   char stanum, i;
+   stanum = 0;
+
+   for (i=0; i<8; i++)
+   {
+      if (1<<i == station_b) stanum=i+1;
+   }
+   return stanum;
+}
+
+void msDelay(unsigned int delay)
+{
+   auto unsigned long start_time;
+   start_time = MS_TIMER;
+   if (delay < 500) while( (MS_TIMER - start_time) <= delay );
+   else while( (MS_TIMER - start_time) <= delay ) hitwd();
+}
+
+char Timeout(unsigned long start_time, unsigned long duration)
+{
+   return ((MS_TIMER - start_time) < duration) ? FALSE : TRUE;
+}
+
+/*******************************************************/
+// WATCHDOG AND POWER-LOW RESET COUNTERS
+/*******************************************************/
+char valid_resets;     // at myxdata+0
+char watchdog_resets;  // at myxdata+1
+char powerlow_resets;  // at myxdata+2
+//xdata myxdata[10];
+
+/*******************************************************/
+char watchdogCount() { return watchdog_resets; }
+char powerlowCount() { return powerlow_resets; }
+/*******************************************************/
+void incrementWDCount()
+{
+   watchdog_resets++;
+   //root2xmem( &watchdog_resets, myxdata+1, 1);
+}
+/*******************************************************/
+void incrementPLCount()
+{
+   powerlow_resets++;
+   //root2xmem( &powerlow_resets, myxdata+2, 1);
+}
+
+/*******************************************************/
+void loadResetCounters()
+{
+   // read valid_resets and check
+   //xmem2root( myxdata, &valid_resets, 1);
+   if (valid_resets != 69)
+   {  // set to zero and mark valid
+      watchdog_resets=0;
+      //root2xmem( &watchdog_resets, myxdata+1, 1);
+      powerlow_resets=0;
+      //root2xmem( &powerlow_resets, myxdata+2, 1);
+      valid_resets=69;
+      //root2xmem( &valid_resets, myxdata, 1);
+   } else
+   {
+      // Read watchdog and power-low counters
+      //xmem2root( myxdata+1, &watchdog_resets, 1);
+      //xmem2root( myxdata+2, &powerlow_resets, 1);
+   }
+}
+

@@ -1,0 +1,14 @@
+cbWatch0=Uid[1]
+cbWatch1=Uid[0]
+cbWatch2=Uid
+cbWatch3=secureCard.id[0]
+cbWatch4=secureCard.id
+cbWatch5=HBmessage.data[1]
+cbWatch6=di_doorClosed
+cbWatch7=param.UID[0][3]
+cbWatch8=param.UID[0][2]
+cbWatch9=param.UID[0][1]
+cbWatch10=param.UID[0][0]
+cbWatch11=param.UID[i]
+cbWatch12=UID_Search("155777777777")
+cbWatch13=UID_Search("154224091045")

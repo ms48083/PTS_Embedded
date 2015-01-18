@@ -1,0 +1,4748 @@
+/****************************************************************
+   MAINSTREAM_MAIN_V3xx.C
+
+   Purpose:    Main station master control program for Pneumatic Tube Control System
+               Works with MAINSTREAM_REMOTE_V3xx.
+
+   Target:     Z-World BL2500 Rabbit
+
+   Language:   Dynamic C 8.x
+
+   Created:    Jun 12, 2006 by Mike Schwedt (C) MS Technology Solutions
+
+   History:
+   12-Jun-06   v301 Original version created from UW-PSTS_V228
+   13-Sep-06   v302 Change logic state of inputs using bank reads
+   21-Sep-06   v303 Fix menu selection for local diverter (make on/off instead of yes/no)
+
+*****************************************************************/
+#define FIRMWARE_VERSION "MAIN V3.03      "
+// define PRINT_ON for additional debug printing via printf
+#define PRINT_ON 1
+#memmap xmem  // Required to reduce root memory usage
+#class auto
+#use "bl25xx.lib"          Controller library
+#use "rn_cfg_bl25.lib"     Configuration library
+#use "rnet.lib"            RabbitNet library
+#use "rnet_driver.lib"     RabbitNet library
+#use "rnet_keyif.lib"      RN1600 keypad library
+#use "rnet_lcdif.lib"      RN1600 LCD library
+// #use "RS232.lib"
+
+// Define general multipurpose definitions
+#define CVT_SECONDS_TO_MSEC  (unsigned long)1000
+
+// Setup interrupt handling for carrier arrival input
+// Set equal to 1 to use fast interrupt in I&D space
+#define FAST_INTERRUPT 0
+char latchCarrierArrival;
+void my_isr1();
+void arrivalEnable(char how);
+
+// Define communications using TCP/IP (UDP)
+#define TCPCONFIG 1
+#define MAX_UDP_SOCKET_BUFFERS 1
+#define LOCAL_PORT   1234
+#define REMOTE_IP    "255.255.255.255" /*broadcast*/
+#define REMOTE_PORT  1234
+#use "dcrtcp.lib"
+udp_Socket sock;
+int sendEthernetCommand(char sample);
+
+/* Declare data structures */
+struct iomessage                // communications message packet
+{
+   char lplc;                   // little plc board #
+   char command;                // command instruction
+   char station;                // carrier station #
+   char data[4];                // process data
+};
+struct stats_type               // transaction summary statistics
+{
+   long trans_in;               // incoming transactions
+   long trans_out;              // outgoing transactions
+   int  deliv_alarm;            // incomplete delivery timeout alarm
+   int  divert_alarm;           // diverter timeout alarm
+   int  other_alarm;            // other alarms?
+};
+struct trans_log_type           // transaction logging info
+{
+   unsigned long start_tm;      // time of departure
+   unsigned long end_tm;        // time of arrival
+   unsigned long malf_tm;       // time of malfunction
+   int  malf_type;              // type of malfunction
+                                // 1 = diverter timeout
+                                // 2 = carrier exit (lift) timeout
+                                // 3 = delivery overdue timeout
+                                // 4 = blower timeout
+   int  source_sta;             // where it came from
+   int  dest_sta;               // where it went to
+};
+// Including parameter block structure
+// All parameters here are read to / written from FLASH
+struct par_block_type
+{  // Define all parameters that are saved in flash
+   // They are r/w by readParameterSettings() and writeParameterSettings()
+   char sysid;
+   char names_init;
+	char stacking_ok[2];
+   char remote_stat_alert;
+	char diverter_config;    // local diverter configuration
+   char activeStations;     // active station set
+   int  autoPurgeTimer;     // auto purge timer in seconds
+   int  deliveryTimeout;    // delivery timeout in seconds
+   char turnaround_config;
+   char pw_enabled;
+   char syspassword[5];
+   struct {char name[12];} station_name[9];
+} param;
+#define system_name  8  // last one is the system name   char station_names[12][8];
+
+// ------------------------------
+// MISCELLANEOUS DEFINITIONS HERE
+// ------------------------------
+   char  arrival_sound_flag, alarm_sound_flag;
+	char diverter_map[8];    // to assign diverter positions to stations
+	unsigned long diverter_start_time;  // these used primarily by diverter functions
+	unsigned long menu_timeout;
+	char diverter_setting;
+	char diverter_attention;
+	char printlog_active;    // whether printout of trans log is enabled
+	char  printer_error;     // stops printing on printer_wait timeout
+	#define turnaroundStation 0x80 // 8=turnaround station bit
+// ------------------------------
+// ------------------------------
+
+//////
+// RabbitNet RN1600 Setup
+//////
+//#define MATCHFLAG RN_MATCH_PRDID  //set flag to search for product ID
+//#define MATCHPID  RN1600         //RN1600 KDIF card
+int DevRN1600;                    // Rabbit Net Device Number Keypad/LCD
+int DevRN1100;                   // Rabbit Net Device Number Digital I/O
+//configure to sinking safe state
+#define OUTCONFIG 0xFFFF
+
+/////
+//local macros
+/////
+#define ON           0xFF
+#define OFF          0x00
+#define FLASH        0x01
+//#define TRUE         0xFF
+//#define FALSE        0x00
+//#define ON 1
+//#define OFF 0
+// macros for I/O processing functions
+#define INIT       0
+#define RUN        1
+#define OPERATE    2
+#define TRIGGERED  3
+#define RUNNING    4
+#define HOLD       5
+//#define MAX_SAFE_ULONG  4291367295
+#define ALL_STATIONS 0x7F   // hardware will support 7 stations
+#define LAST_STATION    7   // # of bits from STATION_SET
+//#define STATION_SET  0x7F   // active stations
+char    STATION_SET;        // active stations
+char    activeStations;     // as programmed from the menu
+char    FIRST_LPLC;
+char    LAST_LPLC;
+char    ALL_LPLCS;
+#define MAX_LPLCS       7   // maximum number of remote plc's
+
+/* Serial communications send and receive commands */
+#define NAK 0x15
+#define ACK 0x06
+#define STX 0x02
+#define ETX 0x03
+#define DINBUFSIZE 63
+#define DOUTBUFSIZE 63
+
+#define SET_DIVERTER       'A'
+#define DIVERTER_STATUS    'B'
+#define DIVERTER_READY     'C'
+#define DIVERTER_NOT_READY 'D'
+#define RETURN_INPUTS      'E'
+#define INPUTS_ARE         'E'  // set equal to RETURN_INPUTS (v2)
+#define SET_OUTPUTS        'G'
+#define CLEAR_OUTPUTS      'H'
+#define SET_MODE           'I'
+#define ARE_YOU_READY      'J'
+#define RETURN_EXTENDED    'K'
+#define TRANS_COMPLETE     'X'
+#define RESET              'Y'
+#define MALFUNCTION        'Z'
+
+// Declare system timeouts
+#define DIVERTER_TIMEOUT   30000       // How long to set diverter in msec
+#define CIC_EXIT_TIMEOUT   15000       // How long for carrier to escape
+int deliveryTimeout;                   // Number of seconds - dynamic
+#define MALFUNC_TIMEOUT    30000       // How long in malfunction loop
+#define PRIORITY_TIMEOUT   120         // Priority reset in seconds
+#define PASSWORD_TIMEOUT   10000       // Timeout for operator entry
+// #define LARGE_ULONG        0xEFFFFFFF  // for timer resets
+char autoPurgeTimer;                   // In seconds
+
+/* Declare I/O device indexes */
+#define devInUseSolid  0
+#define devInUseFlash  1
+#define devAlert       2
+#define devAlarm       3
+
+/* Array index values for remote data returned by INPUTS_ARE command. */
+#define REMOTE_CIC      0
+#define REMOTE_DOOR     1
+#define REMOTE_ARRIVE   2
+#define REMOTE_RTS      3
+
+// Digital I/O definitions
+// INPUTS
+int readDigInput(char channel);
+// dio_ON|OFF must be used ONLY in primatives readDigInput and setDigOutput
+// they reflect the real state of the logic inputs and outputs
+#define dio_ON  0
+#define dio_OFF 1
+// Menu/Next button assigned to input I-0
+#define di_carrierArrival    readDigInput(0)
+#define di_carrierInChamber  readDigInput(1)
+#define di_doorClosed        readDigInput(2)
+#define di_priorityRequest   readDigInput(3)
+#define di_returnCarrier     readDigInput(4)
+#define di_requestToSend     ~digBankIn(1)
+#define di_diverterPos       (readDigInput(16) & (readDigInput(17) << 1))
+#define di_pushButton(value) !readDigInput(5+value)
+
+// OUTPUTS
+void setDigOutput(int channel, int value);
+#define do_shift 0
+#define do_closeDoorAlarm(value)   setDigOutput(6+do_shift,value)
+#define do_blowerVAC(value)        setDigOutput(12+do_shift,value)
+#define do_blowerPRS(value)        setDigOutput(13+do_shift,value)
+#define do_alert(value)            setDigOutput(11+do_shift,value & arrival_sound_flag)
+#define do_diverter(value)         setDigOutput(8+do_shift,value)
+#define do_alarmLight(value)       setDigOutput(9+do_shift,value)
+#define do_alarmSound(value)       setDigOutput(10+do_shift,value)
+#define do_priorityLight(value)    setDigOutput(15+do_shift,value)
+#define do_CICLight(value)         setDigOutput(16+do_shift,value)
+#define beep(value)                rn_keyBuzzerAct(DevRN1600, value, 0)
+void inUse(char how, char station_b);
+void alarm(char how);
+//void alert(char how, char station_b);
+
+/*
+void setBlower(char how);     // use blowerSend, blowerReturn, blowerOff blowerIdle
+unsigned long blowerRunningTime(void);
+void checkBlowerIdleTimeout(void);
+#define blowerOFF        0
+#define blowerIDLE       1
+#define blowerSEND       2
+#define blowerRETURN     3
+*/
+
+// Keypad definitions
+//#define KEYSTROBLINES 0x0070      //strobe lines for 3x4 keypad
+#define KEYSTROBLINES 0x003C     //strobe lines for 4x4 keypad
+#define KEYMENUNEXT  'A'
+#define KEYAUTOMAN   'B'
+#define KEYAUTOPURGE 'C'
+#define KEYADDC02    'D'
+char getKey(void);
+/**********************************************
+   3x4 keypad index:
+   [ 19  ] [ 18  ] [ 17  ] [ 16  ]
+   [ 11  ] [ 10  ] [  9  ] [  8  ]
+   [  3  ] [  2  ] [  1  ] [  0  ]
+
+   Associated character assignments:
+   [  1  ] [  2  ] [  3  ] [  +  ]
+   [  4  ] [  5  ] [  6  ] [  -  ]
+   [  7  ] [  8  ] [  9  ] [  0  ]
+      |  |  |  |  |  |  |  |  |  |
+      |  |  |  |  |  |  |  |  |  |
+      9  8  7  6  5  4  3  2  1  0
+
+   Connector Pins 6,5,4 are output strobes.
+**********************************************/
+void configKeypad3x4(int device)
+{
+   //setup characters on keypad
+   // for GS120203 keypad
+   rn_keyConfig (device, 24,KEYMENUNEXT,0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 25,KEYAUTOMAN,0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 31,KEYAUTOPURGE,0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 30,KEYADDC02,0, 250, 250, 0, 0 );
+
+   rn_keyConfig (device, 16,'3',0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 17,'6',0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 23,'9',0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 22,'-',0, 250, 100, 250, 25 );
+
+   rn_keyConfig (device,  8,'2',0, 0, 0, 0, 0 );
+   rn_keyConfig (device,  9,'5',0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 15,'8',0, 0, 0, 0, 0 );
+   rn_keyConfig (device, 14,'0',0, 0, 0, 0, 0 );
+
+   rn_keyConfig (device,  0,'1',0, 0, 0, 0, 0 );
+   rn_keyConfig (device,  1,'4',0, 0, 0, 0, 0 );
+   rn_keyConfig (device,  7,'7',0, 0, 0, 0, 0 );
+   rn_keyConfig (device,  6,'+',0, 250, 10, 250, 10 );
+
+}
+// Functions for digital input based keys
+char  functionButton(char which, char how);
+#define  FUNC_BUTT  0x00
+#define  FUNC_F1    0x01
+#define  FUNC_F2    0x02
+#define  FUNC_TRIG  0x01                // triggered (latched) mode
+#define  FUNC_CURR  0x02                // current button state
+#define  FUNC_HELD  0x03                // auto repeat key
+#define  FUNC_DELAY 1000                // auto repeat delay
+#define  FUNC_RATE  100                 // auto repeat rate
+
+
+// LCD definitions
+#define DISPROWS 4    //number of lines in display
+#define DISPCOLS 16    //number of columns in display
+void initializeMessages(void);
+void message_add(char lcd, char msg1, char msg2, char how);
+void message_del(char lcd, char msg1, char msg2);
+void message_show(char how);
+void message_refresh(void);
+void refresh_timer_message(char msg);
+void lcd_initialize(void);
+void lputs(char line, char* msg);
+void reset_msg_timer(void);
+void lcd_print(char lcd, char line, char* message);
+void lcd_show_cursor(char lcd, char line, char pos);
+void setTimeMessages(char message, unsigned long timedate);
+void setFlagMessage(char flag);
+void setParValueMessage(char MSG_message, unsigned long par_value, char * par_units);
+void manualIOControl(void);
+void maintenance(void);
+#define EMPTY        255      // empty message
+#define QUEUESIZE    20       // max number of messages per lcd
+#define SCROLLTIME   2000     // 2 seconds
+#define NOW          1        // show message immediately
+#define NEXT         2        // show message next
+#define ONESHOT      3        // show message once right now
+#define ONESHOTA     4        // show message once first of 2 oneshots
+#define LCDCOUNT     2        // how many lcds connected
+#define TRANSLCD     0        // Trasaction Status display
+#define SYSTEMLCD    1        // System Status display
+/* Define STATIC LCD messages */
+#define MSGCOUNT  101
+const char * sysmsg[MSGCOUNT] = {
+"  SYSTEM READY  ","  ------------  ",
+"<< NEXT TRANS >>","<<  PRIORITY  >>",
+" LOG TO PRINTER "," LOCAL DIVERTER ",
+" ENTER PASSWORD ","VERIFY PASSWORD ",
+" TRANS TIMEOUT  "," PLEASE WAIT... ",
+"  SYSTEM ALARM  ","SEE MAINTENANCE ",
+"SETTING DIVERTER","   DOOR OPEN    ",
+"CARR. IN CHAMBER","DELIV. UNREMOVED",
+"DELIVERY OVERDUE"," CARRIER RETURN ",
+" MANUAL CONTROL ","TRANS. CANCELED ",
+"NO COMMUNICATION","FROM REMOTE CPU ",
+"  WAITING FOR   "," TRANS REQUEST  ","SET TIME & DATE ",
+"PENDING DELIVERY","    IN ROUTE    ","    IN ROUTE    ",
+"    TIMEOUT     ","     ERROR      "," REMOTE STATION "," FUNCTION MODE  ",
+"   SET HOURS    ","  SET MINUTES   ","  SET SECONDS   ",
+"    SET DAY     ","   SET MONTH    ","    SET YEAR    ",
+" F1=UP  F2=DOWN "," F1=ON   F2=OFF "," F1=SND  F2=RTN ",
+" ARRIVAL SOUND  ","  ALARM SOUND   ","  ALARM RESET   ",
+"    F1=RESET    "," SYSTEM IS BUSY ",
+" TO RESET, PUSH "," MODE + F1 + F2 ",
+"SHOW COMM STATS "," F1=YES   F2=NO ",
+"   EDIT NAMES   "," PRINT SUMMARY  ",
+"       @M       ","       @1       ",
+"       @2       ","       @3       ","       @4       ",
+"       @5       ","       @6       ","       @7       ",
+"       <M       ","       <1       ",
+"       <2       ","       <3       ","       <4       ",
+"       <5       ","       <6       ","       <7       ",
+"       >M       ","       >1       ",
+"       >2       ","       >3       ","       >4       ",
+"       >5       ","       >6       ","       >7       ",
+"  F1=PRESSURE   ","  F2=VACUUM     ",
+"AUTOMATIC PURGE ","DEFINE STATIONS "," SELECT STATION ",
+"--END OF MENU---","   NOT READY    ","  ERROR SAVING  ",
+" STACK AT MAIN  ","STACK AT REMOTE "," RESET COUNTER  ",
+" TIME: HR:MN    "," DATE: MO/DY/YR ","                ",
+" CURRENTLY Oxx  "," MO/DY/YR HR:MN ","   DO NOT USE   ",
+"  SET PASSWORD  ","F1=SET  F2=CLEAR",
+" SET TURNAROUND ","F1=MAIN F2=REMOT",
+"PARAMETER VALUE ","ADV SETUP ENABLD",
+"RM.ALERT ON STAT","                "};      // last element always blank
+
+// Define message indexes into rom or ram messages
+#define MSG_SDEFAULT     0
+#define MSG_SDEFAULT2    1
+#define MSG_PRIORITY     2
+#define MSG_LOG2PRINTER  4
+#define MSG_LOCALDIVERTER 5
+#define MSG_ENTERPW      6
+//#define MSG_TESTING    8
+#define MSG_SET_TIMEOUT  8
+#define MSG_ALARM       10
+#define MSG_SETTING     12
+#define MSG_DROPEN      13
+#define MSG_CIC         14
+#define MSG_ARVALRT     15
+#define MSG_ODUE        16
+#define MSG_RTRN        17
+#define MSG_PURGE       18
+#define MSG_NOCOMM      20
+#define MSG_SET_CLOCK   24
+#define MSG_PENDING     25
+#define MSG_SEND        26
+#define MSG_RETURN      27
+#define MSG_TIMEOUT     28
+#define MSG_ERROR       29
+#define MSG_REMOTESTA   30
+#define MSG_FUNCTION    31
+#define MSG_SET_HOURS   32
+#define MSG_INC_DEC     38
+#define MSG_ON_OFF      39
+#define MSG_SND_RTN     40
+#define MSG_ARRIVE_SND  41
+#define MSG_ALARM_SND   42
+#define MSG_ALARM_RESET 43
+#define MSG_RESET       44
+#define MSG_SYSBUSY     45
+#define MSG_SHOW_COMM   48
+#define MSG_YES_NO      49
+#define MSG_SET_STANAMES 50
+#define MSG_PRINT_SUMMARY 51
+#define MSG_AT          52       // points to message before station 1
+#define MSG_FROM        60       //   ..
+#define MSG_TO          68       //   ..
+#define MSG_F1_PRESSURE 76
+#define MSG_F2_VACUUM   77
+#define MSG_AUTO_PURGE  78
+#define MSG_DEF_STATIONS 79
+#define MSG_SEL_STATION 80
+#define MSG_END_OF_MENU 81
+#define MSG_NOT_READY   82
+#define MSG_SAVE_ERROR  83
+#define MSG_MSTACKING   84
+#define MSG_RSTACKING   85
+#define MSG_RESET_COUNT 86
+#define MSG_TIME        87
+#define MSG_DATE        88
+#define MSG_TRANS_COUNT 89
+#define MSG_FLAG_SET    90     // on/off flag setting
+#define MSG_DATE_TIME   91
+#define MSG_DONTUSE     92
+#define MSG_SETPASSWORD 93
+#define MSG_SETCLEAR    94
+#define MSG_TURNAROUND  95
+#define MSG_MAINREMOTE  96
+#define MSG_PAR_VALUE   97
+#define MSG_ADV_SETUP   98
+#define MSG_RMTALRTSTAT 99
+#define MSG_BLANK       MSGCOUNT-1
+#define MSG_TDEFAULT    MSG_DATE_TIME
+#define MSG_TDEFAULT2   MSG_TRANS_COUNT
+
+// Define structure and array for variable type messages
+// message length is 16 or 20 (+1 for null terminator \n)
+#define MSG_LEN 16
+struct msgbuftype {char msg[MSG_LEN+1];} sys_message[MSGCOUNT];
+
+// Timer array definitions
+
+// Constant timers and timeouts
+//#define RETURN_CYCLE_TIMER 10000
+
+// Event log definitions
+
+// Diagnostic Menu/Setup/Parameters function definitions
+void enterSetupMode(char menu_flag, char *sys_state);
+void displayFunctionMessage(char mnu_base, char msg_item, char msg_value);
+char functionSetTime(char what_timer, char index, unsigned long *time_val);
+char functionSetParValue(char menu_item, unsigned long * par_value,
+         unsigned long par_min, unsigned long par_max, char * par_units);
+char functionDefineStations(void);
+int readParameterSettings(void);
+int writeParameterSettings(void);
+int checkSystemSafeties(void);
+void displaySafetyStatus(int status);
+char nextMenuItem(char idx, char flag);
+
+// General/Misc definitions
+char init_communication(void);
+void showactivity(void);
+void msDelay(unsigned int delay);
+char secTimeout(unsigned long ttime);
+void toggleLED(char LEDDev);
+void initialize_system(void);
+char bit2station(char station_b);
+char station2bit(char station);
+char firstBit(char bitdata);
+//void diverter(char how);
+void set_diverter(char station);
+void check_diverter(void);
+char divertersReady(char station);
+void setDiverterConfiguration(void);
+char  valid_send_request(char station_b);
+// transaction request queue functions   USE BIT VALUES
+void queueAdd(char source, char dest);   // adds request to queue
+void queueDel(char source, char dest);   // deletes request from queue
+void queueNext(char *source, char *dest);  // returns next queue entry
+char queueVerify(char cic_data, char door_data);  // validate queue entries
+char send_n_get(struct iomessage message, struct iomessage *response);
+char send_command(struct iomessage);
+char get_response(struct iomessage *);
+char verifyPassword(void);
+char setPassword(void);
+void clearPassword(void);
+char getPassword(char *pwbuff);
+void incrementCounter(void);
+void reset_statistics(void);
+void buildStationNames(void);
+//void  initializeMessages(void);
+unsigned long transactionCount(void);
+void loadTransactionCount(void);
+void resetTransactionCount(void);
+void show_extended_data(void);
+char extendedData[8][4]; // Extended remote data
+void purgeSystem(char auto_purge);
+void exercise_outputs(void);
+void show_comm_status(void);
+void show_comm_test(void);
+void checkRemoteConfiguration(void);
+// PRINTER FUNCTIONS
+void print_line(char *buf);
+void printer_wait(void);
+void print_transaction(struct trans_log_type log);
+void print_summary(struct stats_type stats, char how);
+void print_malfunction(struct trans_log_type log);
+void print_event(char *event);
+long nextAutoPrint;
+//void reset_printer(void);
+void check_auto_report(struct stats_type stats);
+void reset_auto_print(void);
+void time2string(unsigned long time, char *buf, int format);
+
+// State Processing definitions
+void processSystemIO(void);
+char processKeyInput(void);
+void processCycleTime(void);
+//void processOutputLamps(char olOperation);
+char checkDoorWhileRunning(char calling_state);
+
+/* Declare system states */
+#define  IDLE_STATE             0x01
+#define  PREPARE_SEND           0x02
+#define  WAIT_FOR_DIVERTERS     0x03
+#define  BEGIN_SEND             0x04
+#define  WAIT_FOR_MAIN_DEPART   0x05
+#define  WAIT_FOR_REM_ARRIVE    0x06
+#define  HOLD_TRANSACTION       0x07
+#define  WAIT_FOR_REM_DEPART    0x08
+#define  WAIT_FOR_MAIN_ARRIVE   0x09
+#define  WAIT_FOR_TURNAROUND    0x0A
+#define  SHIFT_TURNAROUND       0x0B
+#define  CANCEL_STATE           0x0C
+#define  MALFUNCTION_STATE      0x0D
+#define  FINAL_COMMAND          0x0E
+
+#define  DIR_SEND             1
+#define  DIR_RETURN           2
+
+// Declare blower interfaces
+#define blwrOFF  0
+#define blwrIDLE 1
+#define blwrVAC  2
+#define blwrPRS  3
+
+char blwrConfig; // later to become parameter from eeprom
+
+void blower(char blowerOperatingValue);  // use blwrOFF, blwrIDLE, blwrVAC, blwrPRS
+char processBlower(void);
+char blowerPosition(void);
+
+// Blower state is based on system_state -> [system_state][blwrConfig]
+const char blowerStateTable[15][2] = {
+	blwrOFF,  blwrOFF,	 // Undefined state 0
+	blwrIDLE, blwrIDLE,  // 0x01 (Normal)
+	blwrIDLE, blwrIDLE,  // 0x02
+	blwrIDLE, blwrIDLE,  // 0x03
+	blwrIDLE, blwrIDLE,  // 0x04
+	blwrPRS,  blwrVAC,   // 0x05
+	blwrPRS,  blwrPRS,   // 0x06
+	blwrIDLE, blwrIDLE,  // 0x07
+	blwrVAC,  blwrVAC,   // 0x08
+	blwrVAC,  blwrPRS,   // 0x09
+	blwrIDLE, blwrVAC,   // 0x0A
+	blwrIDLE, blwrIDLE,  // 0x0B
+	blwrIDLE, blwrIDLE,  // 0x0C
+	blwrOFF,  blwrOFF,   // 0x0D
+	blwrIDLE, blwrIDLE };// 0x0E
+
+
+// Globals, system parameters, variables for process state information
+//unsigned long transaction_count;
+//char * const timerUnits = "SEC";
+///char system_state, new_state, alarmActive, first_time_here;
+char op_mode, saved_state;
+//char priority, system_direction, memory_state, arrival_alert;
+unsigned long arrival_time;
+unsigned long state_timer;
+//unsigned long menu_timeout;
+char diagnostic_mode;
+char outputvalue[4];  // digital output buffers
+#define devInUseSolid  0
+#define devInUseFlash  1
+#define devAlert       2
+#define devAlarm       3
+
+struct iomessage finalcmd;
+char system_state, system_station, system_stationb, malfunctionActive;
+char priority, system_direction, memory_state, arrival_alert;
+char arrival_from;
+unsigned long main_arrival;
+unsigned long priority_seconds;
+//unsigned long state_timer;
+static struct stats_type statistics;
+
+void main()
+{
+   /* Declare local variables */
+   struct iomessage testcmd, testrsp;
+   unsigned long testtime, t1, t2, comfail;
+   char i;
+   char * genptr;
+   auto rn_search newdev;
+   int status;
+
+   // Initialize the controller
+   brdInit();              // Initialize the controller
+   rn_init(RN_PORTS, 1);   // Initialize controller RN ports
+
+   // Verify that the Rabbitnet boards are connected
+   newdev.flags = RN_MATCH_PRDID;
+   newdev.productid = RN1100;
+   if ((DevRN1100 = rn_find(&newdev)) == -1)
+   {
+      printf("\n no RN1100 found\n");
+   }
+   else status = rn_digOutConfig(DevRN1100, OUTCONFIG);  //configure safe state
+
+   newdev.productid = RN1600;
+   if ((DevRN1600 = rn_find(&newdev)) == -1)
+   {
+      printf("\n no RN1600 found\n");
+   }
+
+   /* Initialize counter/timer, etc */
+   //init_counter();   // enable 1 msec timer
+   //init_system();    // initialize system state variables, etc.
+
+   // setup diverter mappings.
+   setDiverterConfiguration();
+
+   hitwd();          // "hit" the watchdog timer
+
+   /* Initialize digital outputs */
+   inUse(OFF, ALL_STATIONS);
+   do_alert(OFF);
+   alarm(OFF);
+ 	blower(blwrOFF);
+
+   init_communication();          // Initialize serial communications
+   initializeMessages();     // Initialize dynamic (RAM) messages
+   loadTransactionCount();   // Read transaction counter from EEPROM
+   //loadvec1();               // Initialize arrival interrupt
+
+   /* Initialize LCD displays */
+//   msDelay(500);  // hold off initialize to wait for expansion powerup
+   hitwd();
+   lcd_initialize();
+   /// CHANGE HOW message_add(TRANSLCD, MSG_TESTING, MSG_TESTING+1, NOW);
+//   lcd_print(TRANSLCD, 0, " TESTING SYSTEM ");
+	lcd_print(TRANSLCD, 0, FIRMWARE_VERSION);
+   lcd_print(TRANSLCD, 1, "PLEASE WAIT...  ");
+
+   hitwd();
+
+   /* Exercise all lighted outputs except on watchdog reset */
+   // if (!wderror())
+   if (1) // don't have way to check if reset was by watchdog
+   {
+      // if normal startup and MODE enable maintenance mode
+      if ( functionButton(FUNC_BUTT, FUNC_CURR))
+           //&& functionButton(FUNC_F1, FUNC_CURR)
+           //&& functionButton(FUNC_F2, FUNC_CURR))
+      {  diagnostic_mode=TRUE;
+         lcd_print(SYSTEMLCD, 0, " DIAGNOSTIC MODE");
+         lcd_print(SYSTEMLCD, 1, "     ACTIVE     ");
+         msDelay(1000);
+      }
+      else diagnostic_mode=FALSE;
+	   // show diag mode on LCD
+	   //diagnostic_mode=FALSE;
+	   //if (di_sampDispatch) diagnostic_mode=TRUE;
+	   //if (diagnostic_mode)
+	   //{  lcd_print(0, 0, "Advanced Setup Enabl");
+	   //}
+
+//	   lcd_print(0, 1, FIRMWARE_VERSION);
+//	   msDelay(1500);
+
+	   // show missing H/W on LCD
+	   if (DevRN1100 == -1)
+	   {  lcd_print(1, 0, "NO RN1100 FOUND...  ");
+	      msDelay(1000);
+	   }
+
+      lcd_print(SYSTEMLCD, 0, "CHECK INDICATORS");
+      lcd_print(SYSTEMLCD, 1, "                ");
+      exercise_outputs();
+
+      if ((param.stacking_ok[0] > 1) || (param.stacking_ok[1] > 1))
+      {   // eeprom not setup or other error
+         lcd_print(SYSTEMLCD, 0, "BAD STACKING VAL");
+         lcd_print(SYSTEMLCD, 1, "  VALUES RESET  ");
+         msDelay(2000);
+         // no message, just default to OFF
+         param.stacking_ok[0]=0; param.stacking_ok[1]=0;
+      }
+
+
+      checkRemoteConfiguration();             // how many remotes, etc.
+
+      lcd_print(SYSTEMLCD, 0, " COMMUNICATION  ");
+      lcd_print(SYSTEMLCD, 1, "TEST STATISTICS ");
+
+      // send message for 3 seconds and show statistics
+      testcmd.lplc=ALL_LPLCS;
+      testcmd.command=RETURN_INPUTS;
+      testcmd.station=0;
+      testcmd.data[0]=0;
+      testcmd.data[1]=0;
+      testcmd.data[2]=0;
+      for (i=0; i<3; i++)
+      {
+         hitwd();
+         testtime=MS_TIMER;
+         while (MS_TIMER-testtime < 1000)
+         { msDelay(7);
+           send_n_get(testcmd, &testrsp);
+         }
+      }
+      show_comm_test();
+      // One more command for extended data
+      testcmd.command=RETURN_EXTENDED;
+      send_n_get(testcmd, &testrsp);
+      // Show extended data
+      show_extended_data();
+   }
+   else
+   {
+      lcd_print(SYSTEMLCD, 0, "  SYSTEM RESET   ");
+      lcd_print(SYSTEMLCD, 1, "WATCHDOG TIMEOUT ");
+      msDelay(3000);
+   }
+
+
+   // Finish LCD setup
+//   initialize_messages();
+   toggleLED(255);  // initialize LED outputs
+
+   // Initialize Keypad
+   rn_keyInit(DevRN1600, KEYSTROBLINES, 5);
+   configKeypad3x4(DevRN1600);   // Set keys to the default driver configuration
+
+   // setup interrupt handler for arrival optics
+#if __SEPARATE_INST_DATA__ && FAST_INTERRUPT
+	interrupt_vector ext1_intvec my_isr1;
+#else
+	SetVectExtern3000(1, my_isr1);
+   // re-setup ISR's to show example of retrieving ISR address using GetVectExtern3000
+	SetVectExtern3000(1, GetVectExtern3000(1));
+#endif
+	WrPortI(I1CR, &I1CRShadow, 0x09);		// enable external INT1 on PE1, rising edge, priority 1
+
+   // Initialize other system configuration
+   //timerInitialize();
+   initialize_system();
+
+   // Initialize processor communications UDP
+   sock_init();
+   if(!udp_open(&sock, LOCAL_PORT, resolve(REMOTE_IP), REMOTE_PORT, NULL)) {
+      printf("udp_open failed!\n");
+      lcd_print(1, 0, "No IP Communications");
+      msDelay(1000);
+   }
+
+//timerStartNext();
+
+/* BEGIN MAIN LOOP */
+   while(1)
+   {
+      //inUse(FLASH, 0xAA);
+      //inUse(ON, 0x55);
+      maintenance();  // watchdog, led activity, UDP commands, inUse lights
+
+      rn_keyProcess(DevRN1600, 0);  // process keypad device
+
+      showactivity();      /* flashes the plc board led */
+
+      show_comm_status();  // update lcd with comm status
+
+      message_show(NEXT);  // show next message in queue
+
+      processSystemIO();   // check system processes
+
+   }
+}
+nodebug root interrupt void my_isr1()
+{
+	latchCarrierArrival=TRUE;
+}
+void arrivalEnable(char how)
+{
+   // should call this routine once to enable interrupt and once to disable
+
+   latchCarrierArrival=FALSE;    // clear existing latch
+   if (how)
+   {   //outport(ITC,(inport(ITC))|0x02);      // enable  INT1
+   	WrPortI(I1CR, &I1CRShadow, 0x09);		// enable external INT1 on PE1, rising edge, priority 1
+   } else
+   {   //outport(ITC,(inport(ITC))&~0x02);     // disable INT1
+   	WrPortI(I1CR, &I1CRShadow, 0x00);		// disble external INT1 on PE1
+   }
+}
+
+void initialize_system()
+{  // Setup system i/o processing routine
+   if ( readParameterSettings() != 0)
+   {  lcd_print(1, 0, "ERROR READING PARAMS");
+      msDelay(800);
+   }
+   priority=0;
+   outputvalue[0]=0;     // clear expansion bus output buffers
+   outputvalue[1]=0;
+   outputvalue[2]=0;
+   outputvalue[3]=0;
+   arrival_alert=0;
+   main_arrival=0;
+   arrival_from=0;
+   system_station=0;
+   system_stationb=0;
+   arrival_sound_flag=TRUE;
+   alarm_sound_flag=TRUE;
+   malfunctionActive=FALSE;
+
+   // init_blower();
+
+   //reset_auto_print();
+   reset_statistics();
+   queueDel(0,0);            // initialize request queue
+
+   // check turnaround configuration and make sure it is valid
+   if ((param.turnaround_config != TRUE) && (param.turnaround_config != FALSE)) param.turnaround_config=FALSE;
+   if (param.turnaround_config) activeStations |= 0x80;  // station 8 programmed by turnaround setting
+
+//   new_state=system_state;
+//   first_time_here=TRUE;
+   functionButton(0,0);      // Initialize function mode buttons
+   setParValueMessage(MSG_TRANS_COUNT, transactionCount(), "");
+//   processOutputLamps(INIT);
+//   checkDoorWhileRunning(0, 0);
+//   displaySafetyStatus(0);  // reset display of system warnings/alarms
+	latchCarrierArrival=0;  // clear latch
+}
+
+void processCycleTime()
+{  // calculate and display cycle time statistics
+#define CYCLETIME_UPDATE 2000
+   static int ct_min, ct_avg, ct_max;
+   static int ct_loops;
+   static unsigned long cycle_start;
+   static unsigned long ct_last;
+   unsigned long cycle_time;
+
+   if (MS_TIMER - cycle_start >= CYCLETIME_UPDATE)
+   {  if (ct_loops > 0) ct_avg = (int)((MS_TIMER - cycle_start) / ct_loops);
+      printf("\n n=%d min=%d avg=%d max=%d", ct_loops, ct_min, ct_avg, ct_max);
+      ct_max=0;
+      ct_min=32767;
+      ct_loops=0;
+      cycle_start=MS_TIMER;
+   }
+   else
+   {
+      cycle_time = MS_TIMER - ct_last;
+      ct_loops = ct_loops + 1;
+      if (cycle_time > ct_max) ct_max = (int)cycle_time;
+      if (cycle_time < ct_min) ct_min = (int)cycle_time;
+   }
+   ct_last = MS_TIMER;
+}
+
+char remote_data[4];
+void processSystemIO()
+{
+   struct iomessage command, response, xtended;
+   char code, received, k, kbit, XtraCic, FirstXtraCic;
+   static char new_state;
+   char func, menu_item, func_mode;
+   static char first_time_here;
+   //char remote_data[4];
+   static struct trans_log_type translog;
+//   int safetyStatus;
+   static unsigned long auto_purge_timer;
+   char key;
+
+   #GLOBAL_INIT
+   {
+	   first_time_here = TRUE;
+	   system_state=CANCEL_STATE;
+      new_state=system_state;
+	   state_timer=MS_TIMER;
+	}
+
+
+   // First process items always needing attention
+   check_diverter();
+   processBlower();
+   //safetyStatus = checkSystemSafeties();
+   //displaySafetyStatus(safetyStatus);
+   key = processKeyInput();
+   processCycleTime();
+   //processOutputLamps(OPERATE);
+   //checkBlowerIdleTimeout();
+
+   // activate priority (next transaction) if requested
+   if (di_priorityRequest)
+   {  priority = TRUE;
+      priority_seconds = SEC_TIMER + PRIORITY_TIMEOUT;
+      do_priorityLight(ON);
+      message_add(SYSTEMLCD, MSG_PRIORITY, MSG_PRIORITY+1, NOW);
+   }
+   // deactivate priority after timeout, if not in a transaction
+   if (priority && (SEC_TIMER > priority_seconds) && (system_state == IDLE_STATE))
+   {  priority = FALSE;
+      do_priorityLight(OFF);
+      message_del(SYSTEMLCD, MSG_PRIORITY, MSG_PRIORITY+1);
+   }
+
+   // handle carrier in chamber light
+   do_CICLight(di_carrierInChamber);
+
+   // if main door open, add message, else del.
+   if ( di_doorClosed )
+   {  message_del(SYSTEMLCD, MSG_DROPEN, MSG_AT); }
+   else
+   {  message_add(SYSTEMLCD, MSG_DROPEN, MSG_AT, NEXT); }
+
+   // show carrier in chamber
+   if ( di_carrierInChamber )
+      message_add(SYSTEMLCD, MSG_CIC, MSG_AT, NEXT);
+   else
+      message_del(SYSTEMLCD, MSG_CIC, MSG_AT);
+
+   // Check some remote inputs ... sends some data also
+   command.lplc=ALL_LPLCS;
+   command.command=RETURN_INPUTS;
+   command.station=0;
+   // send the main arrival state to indicate not ready for transaction
+   if (main_arrival) command.data[0]=arrival_from;
+   else command.data[0]=0;
+   // send the system_state (for turnaround controller to operate blower)
+   command.data[1]=system_state;
+   command.data[2]=system_direction;
+
+   if (send_n_get(command, &response))
+   {
+      if (response.command==INPUTS_ARE)
+      {
+        // store remote response in local var
+        for (k=0; k<4; k++) remote_data[k]=response.data[k];
+        // force unused doors closed (on) and other unused inputs off
+        remote_data[REMOTE_DOOR] |= ~STATION_SET;
+        remote_data[REMOTE_CIC] &= STATION_SET;
+        remote_data[REMOTE_RTS] &= STATION_SET;
+
+        // flash inuse when cic and not stacking
+        if (remote_data[REMOTE_CIC] && !param.stacking_ok[1])
+        {
+          // flash those with carriers unless stacking is allowed
+          if (malfunctionActive) inUse(FLASH, remote_data[REMOTE_CIC]);
+          else inUse(FLASH, remote_data[REMOTE_CIC] & ~system_stationb);
+        }
+        // turn others off except system station
+        if (malfunctionActive) inUse(OFF, ~remote_data[REMOTE_CIC]);
+        else inUse(OFF, ~remote_data[REMOTE_CIC] & ~system_stationb);
+
+        // for each with the door open and no cic, clear the arrival-alert
+        if (arrival_alert)
+           arrival_alert &= (remote_data[REMOTE_CIC]
+                         | remote_data[REMOTE_DOOR])
+                         & ~system_stationb;
+
+        // clear main arrival alert when door opens and no more carrier
+        //if (main_arrival && !di_carrierInChamber)
+        if (main_arrival)
+        {
+          // check for 10 second arrival alert signal
+          if ( (SEC_TIMER - main_arrival) %20 >= 10 )
+          		do_alert(ON);
+          else do_alert(OFF);
+
+          // check to clear main arrival alert
+          if (!di_doorClosed && !di_carrierInChamber)
+          {  main_arrival=0;
+             arrival_from=0;
+             message_del(SYSTEMLCD, MSG_ARVALRT, MSG_AT);
+             do_alert(OFF);
+			    latchCarrierArrival=FALSE;    // clear latch
+          }
+       }
+
+       // for each station, check several conditions.
+       for (k=1; k<=LAST_STATION; k++)
+       {
+          kbit=station2bit(k);      // setup bit equivalent
+
+          // for each with a door open, add door message, else del.
+          if (remote_data[REMOTE_DOOR] & kbit)
+             message_del(SYSTEMLCD, MSG_DROPEN, MSG_AT+k);
+          else
+             message_add(SYSTEMLCD, MSG_DROPEN, MSG_AT+k, NEXT);
+
+          // for each with a carrier, add carrier message ... else del.
+          if (remote_data[REMOTE_CIC] & kbit)
+             message_add(SYSTEMLCD, MSG_CIC, MSG_AT+k, NEXT);
+          else
+             message_del(SYSTEMLCD, MSG_CIC, MSG_AT+k);
+
+          // for each with a request-to-send, add pending message, else del.
+          if (remote_data[REMOTE_RTS] & kbit)
+             message_add(SYSTEMLCD, MSG_PENDING, MSG_FROM+k, NEXT);
+          else
+             message_del(SYSTEMLCD, MSG_PENDING, MSG_FROM+k);
+
+          // for each with arrival-alert, add warning, else del.
+          if (arrival_alert & kbit)
+             message_add(SYSTEMLCD, MSG_ARVALRT, MSG_AT+k, NEXT);
+          else
+            message_del(SYSTEMLCD, MSG_ARVALRT, MSG_AT+k);
+
+        }
+      }
+   }
+
+   // reset timer before wraparound
+//   if ( (MS_TIMER > LARGE_ULONG) && !priority) init_counter();
+
+   // Check function button requests
+   func = functionButton(FUNC_BUTT, FUNC_TRIG);
+   if (func)
+   {  if ( (system_state == IDLE_STATE) || (system_state == MALFUNCTION_STATE) )
+      {  // Enter function mode
+         menu_item=0;
+         enterSetupMode(menu_item, &system_state);
+      } else
+      { // display message how to reset system
+         message_add(TRANSLCD, MSG_FUNCTION, MSG_SYSBUSY, ONESHOT);
+         message_add(SYSTEMLCD, MSG_SYSBUSY+1, MSG_SYSBUSY+2, ONESHOT);
+      }
+   }
+
+   // if system_reset (Abort) and state is not normal|malfunc, cancel
+   while (  functionButton(FUNC_BUTT, FUNC_CURR)
+      && functionButton(FUNC_F1, FUNC_CURR)
+      && functionButton(FUNC_F2, FUNC_CURR)
+      && (system_state != IDLE_STATE)
+      && (system_state != MALFUNCTION_STATE)) system_state=CANCEL_STATE;
+
+
+   // LAST REMOTE COMMAND BEFORE PROCESSING MUST BE "RETURN_INPUTS"
+
+
+   switch (system_state)
+   {
+      case IDLE_STATE:
+
+       // check_auto_report(statistics);   // print summary once a day
+
+       // Check diagnostic carrier return
+       if (di_returnCarrier)
+       {  if ( di_doorClosed &&
+          ( di_requestToSend & remote_data[REMOTE_CIC]
+          & remote_data[REMOTE_DOOR]) )
+          {
+             system_stationb=di_requestToSend;
+             system_station=bit2station(system_stationb);
+             inUse(FLASH, system_stationb);
+             new_state=PREPARE_SEND;
+             system_direction=DIR_RETURN;
+          }
+       }
+       // check remote requests next
+       else if (!priority && (remote_data[REMOTE_RTS] & STATION_SET))
+       {  if ( (di_carrierInChamber==FALSE && main_arrival==0)
+                || param.stacking_ok[0])
+             // only if (no carrier and no arrival_alert) or (stacking is ok)
+          {
+             if (di_doorClosed)
+             {
+                // take first active bit
+                system_station=firstBit(remote_data[REMOTE_RTS]);
+                system_stationb=station2bit(system_station);
+                inUse(FLASH, system_stationb);
+                new_state=PREPARE_SEND;    // RETURN also
+                system_direction=DIR_RETURN;
+             } else
+             {   do_alert(ON);
+             }
+          }
+       } else
+       {  // check main request
+          system_stationb = di_requestToSend & STATION_SET;
+          code = valid_send_request(system_stationb);
+
+          // proceed if good send request, no carrier or stacking
+          if ((code==0)
+               && ( !(remote_data[REMOTE_CIC] & system_stationb)
+                   || param.stacking_ok[1]))
+          {
+             /* Flash this station */
+             inUse(FLASH, system_stationb);
+             new_state=PREPARE_SEND;
+             system_station=bit2station(system_stationb);
+             system_direction=DIR_SEND;
+          }
+       }
+       // check for directory display
+       if (new_state==IDLE_STATE)
+       {  k=di_requestToSend;
+          if (k & STATION_SET)
+          {  system_stationb=k;
+              system_station=bit2station(system_stationb);
+              if (system_station)
+        message_add(TRANSLCD, MSG_REMOTESTA, MSG_AT+system_station, ONESHOT);
+          }
+       }
+
+       FirstXtraCic=TRUE;   // Used in HOLD_TRANSACTION
+       break;
+
+
+      case PREPARE_SEND:      // does job for send and return
+         // turn off priority if it was on
+         // priority = FALSE; TURN OFF LATER (v2.47)
+         message_add(SYSTEMLCD, MSG_SYSBUSY, MSG_DONTUSE, NEXT);
+         message_del(SYSTEMLCD, MSG_PRIORITY, MSG_PRIORITY+1);
+         do_alert(OFF);
+         do_priorityLight(OFF);
+
+         message_add(TRANSLCD, MSG_SETTING, MSG_TO+system_station, NOW);
+
+         // save transaction data
+         translog.start_tm = SEC_TIMER;
+         translog.end_tm = 0;
+         translog.source_sta=0;
+         translog.dest_sta=0;
+         if (system_direction==DIR_SEND) translog.dest_sta=system_station;
+         else translog.source_sta=system_station;
+
+         // tell all system(s) to get ready (set diverters)
+         set_diverter(system_station);
+         command.lplc=ALL_LPLCS;
+         command.command=SET_DIVERTER;
+         command.station=system_station;
+         if (system_direction==DIR_SEND) command.data[0]=1; // ALLIGN MAIN
+         else command.data[0]=2; // ALLIGN REMOTE
+         //command.data[1]=system_state;
+         //command.data[2]=system_direction;
+         received=send_command(command);
+         if (received) new_state=WAIT_FOR_DIVERTERS;
+         else new_state=CANCEL_STATE;
+         break;
+
+      case WAIT_FOR_DIVERTERS:   // does job for send and return
+           if (divertersReady(system_station))
+           {  new_state=BEGIN_SEND;    // serves both directions
+              if (system_direction==DIR_SEND)
+              {  message_add(TRANSLCD, MSG_SEND, MSG_TO+system_station, NOW);
+              }else
+              {  message_add(TRANSLCD, MSG_RETURN, MSG_FROM+system_station, NOW);
+              }
+
+              message_del(TRANSLCD, MSG_SETTING, MSG_TO+system_station);
+           }
+           else
+           {  // only wait for a little time
+             if (MS_TIMER-state_timer >= DIVERTER_TIMEOUT)
+             {  // timeout
+               statistics.divert_alarm++;
+               new_state=MALFUNCTION_STATE;
+               translog.malf_type=1; translog.malf_tm=SEC_TIMER;
+               message_add(TRANSLCD, MSG_TIMEOUT, MSG_SETTING, NEXT);
+             }
+           }
+
+         // while waiting, if different request to send, cancel.
+         if (di_requestToSend
+            && (system_stationb != di_requestToSend)
+            && (system_direction==DIR_SEND))
+               new_state=CANCEL_STATE;
+
+         break;
+
+      case BEGIN_SEND:          // works for both directions
+         // remote should be ready now, but set timeout just in case
+         if (MS_TIMER-state_timer >= 2000)
+         {  new_state=MALFUNCTION_STATE;   // Remote not ready?
+            translog.malf_type=6; translog.malf_tm=SEC_TIMER;
+         }
+
+         // before sending start command double check for cic/stacking
+         command.data[0]=99;
+         if (system_direction==DIR_SEND)
+         {  if ( !(remote_data[REMOTE_CIC] & system_stationb)
+                || param.stacking_ok[1] ) command.data[0]=0; // 0=sending
+         } else
+         {  if ( !di_carrierInChamber || param.stacking_ok[0] )
+               command.data[0]=1;      // 1=returning
+         }
+
+         if (command.data[0] != 99)
+         {
+            // make sure remotes are ready
+            command.lplc=ALL_LPLCS;
+            command.command=ARE_YOU_READY;
+            command.station=system_station;
+            command.data[1]=system_state;
+            command.data[2]=system_direction;
+            if (send_n_get(command, &response))
+            {
+               if ((response.data[0] & STATION_SET) == STATION_SET)  // all stations ok?
+               {
+                  // turn on blower
+                  inUse(ON, system_stationb);
+                  message_del(TRANSLCD, MSG_REMOTESTA, MSG_NOT_READY);
+                  if (system_direction==DIR_SEND)
+                  {  if (di_carrierInChamber)
+                     {  //blower(blowerSend);
+                        new_state=WAIT_FOR_MAIN_DEPART;
+                     }else
+                     {  print_event("TRANSACTION CANCELED - CARRIER REMOVED");
+                        print_transaction( translog );
+                        new_state=CANCEL_STATE;
+                     }
+                  }else
+                  {  if (remote_data[REMOTE_CIC] & system_stationb)
+                     {  //blower(blowerReturn);
+                        new_state=WAIT_FOR_REM_DEPART;
+                     }else
+                     {  print_event("TRANSACTION CANCELED - CARRIER REMOVED");
+                        print_transaction( translog );
+                        new_state=CANCEL_STATE;
+                     }
+                  }
+               } else
+               {  // remote door?
+                  message_add(TRANSLCD, MSG_REMOTESTA, MSG_NOT_READY, NOW);
+                  print_event("STATION(S) NOT READY FOR DISPATCH");
+                  new_state=CANCEL_STATE;
+               }
+            }
+         } else new_state=CANCEL_STATE;  // no stacking allowed
+         break;
+
+      case WAIT_FOR_MAIN_DEPART:
+         // check for doors opening
+         new_state=checkDoorWhileRunning(system_state);
+
+         // wait for carrier to exit
+         if (di_carrierInChamber)
+         {
+            if (MS_TIMER-state_timer >= CIC_EXIT_TIMEOUT)
+            {  // been waiting too long, cancel
+               statistics.other_alarm++;
+               //blower(OFF);
+               translog.malf_type=2; translog.malf_tm=SEC_TIMER;
+               print_malfunction( translog );
+               new_state=CANCEL_STATE;
+            } // else, keep waiting
+         } else
+         {
+            if (param.turnaround_config==TRUE) new_state=WAIT_FOR_TURNAROUND;
+            else new_state=WAIT_FOR_REM_ARRIVE;
+         }
+
+         break;
+
+      case WAIT_FOR_REM_ARRIVE:
+       // keep polling remote status until received, or timeout
+       if (remote_data[REMOTE_ARRIVE] & 0x7F) // at any station 1-7 (exclude turnaround)
+       {
+          //blower(OFF);
+          inUse(OFF, system_stationb);
+          message_del(TRANSLCD, MSG_SEND, MSG_TO+system_station);
+          message_del(SYSTEMLCD, MSG_SYSBUSY, MSG_DONTUSE);
+          arrival_alert |= system_stationb;        // set arrival
+
+          // print transaction data
+          statistics.trans_out++;
+          translog.end_tm = SEC_TIMER;
+          if (printlog_active) print_transaction(translog);
+
+          // notify destination of completion
+          finalcmd.command=TRANS_COMPLETE;
+          finalcmd.station=system_station;
+          finalcmd.data[0]=DIR_SEND;
+          // check if (stat alert is active) or (alert always)
+          if ( (priority==TRUE) || (param.remote_stat_alert==FALSE) )
+          {
+             finalcmd.data[1]=1;
+          } else {
+             finalcmd.data[1]=0;
+          }
+          new_state=FINAL_COMMAND;
+          system_station=0;
+          system_stationb=0;
+       } else
+       {
+
+			// check for doors opening
+	      new_state=checkDoorWhileRunning(system_state);
+
+	      // Check for timeout
+	      //if (MS_TIMER-state_timer >= DELIVER_TIMEOUT)
+	      if (SEC_TIMER-translog.start_tm > deliveryTimeout)
+	      {  message_add(TRANSLCD, MSG_ODUE, MSG_TO+system_station, NEXT);
+	        new_state=MALFUNCTION_STATE;
+	        statistics.deliv_alarm++;
+	        translog.malf_type=3; translog.malf_tm=SEC_TIMER;
+	        //blower(OFF);
+	      }
+       }
+        break;
+
+      case WAIT_FOR_REM_DEPART:
+       // check for doors opening
+       new_state=checkDoorWhileRunning(system_state);
+
+       // wait for carrier to exit
+       if (MS_TIMER-state_timer >= CIC_EXIT_TIMEOUT)
+       {  // been waiting too long, cancel
+          statistics.other_alarm++;
+          //blower(OFF);
+          translog.malf_type=2; translog.malf_tm=SEC_TIMER;
+          print_malfunction( translog );
+          new_state=CANCEL_STATE;
+       }
+
+       if (~remote_data[REMOTE_CIC] & system_stationb)
+       {
+          if (param.turnaround_config==TRUE) new_state=WAIT_FOR_TURNAROUND;
+          else
+          {   new_state=WAIT_FOR_MAIN_ARRIVE;
+              //arrivalEnable(ON);      // enable arrival interrupt
+          }
+       }
+
+       break;
+
+      case WAIT_FOR_TURNAROUND:
+       // check for doors opening
+       new_state=checkDoorWhileRunning(system_state);
+
+       // wait for arrival at turnaround controller
+	      if (remote_data[REMOTE_ARRIVE] & turnaroundStation) // at turnaround
+	      {
+	         // turn off blower
+	         // shift turnaround diverter
+	         message_add(TRANSLCD, MSG_SETTING, MSG_TO+system_station, NOW);
+	         // tell all system(s) to get ready (set diverters)
+	         set_diverter(system_station);
+	         command.lplc=ALL_LPLCS;
+	         command.command=SET_DIVERTER;
+	         command.station=system_station;
+	         command.data[0]=1; // ALLIGN MAIN
+	         if (system_direction==DIR_SEND) command.data[0]=2; // ALLIGN REMOTE
+	         //command.data[1]=system_state;
+	         //command.data[2]=system_direction;
+	         received=send_command(command);
+	         if (received) new_state=SHIFT_TURNAROUND;
+	         else new_state=CANCEL_STATE;
+	      }
+
+       // check for timeout
+         if (SEC_TIMER-translog.start_tm > deliveryTimeout)
+         {  message_add(TRANSLCD, MSG_ODUE, MSG_AT+system_station, NEXT);
+            statistics.deliv_alarm++;
+            new_state=MALFUNCTION_STATE;
+            translog.malf_type=3; translog.malf_tm=SEC_TIMER;
+            //blower(OFF);
+         }
+
+       break;
+
+      case SHIFT_TURNAROUND:
+        // wait for turnaround diverter to be set
+        // check for timeout
+       if (MS_TIMER-state_timer >= DIVERTER_TIMEOUT)
+       {  // timeout
+         statistics.divert_alarm++;
+         new_state=MALFUNCTION_STATE;
+         translog.malf_type=1; translog.malf_tm=SEC_TIMER;
+         message_add(TRANSLCD, MSG_TIMEOUT, MSG_SETTING, NEXT);
+       }
+
+       // wait for turnaround diverter to be set
+       if (divertersReady(system_station))
+        {  // new_state=WAIT_FOR_xxx_ARRIVE;    // serves both directions
+           if (system_direction==DIR_SEND)
+           {  // message_add(TRANSLCD, MSG_SEND, MSG_TO+system_station, NOW);
+              new_state=WAIT_FOR_REM_ARRIVE;
+           }else
+           {  // message_add(TRANSLCD, MSG_RETURN, MSG_FROM+system_station, NOW);
+              //arrivalEnable(ON);      // enable arrival interrupt
+              new_state=WAIT_FOR_MAIN_ARRIVE;
+           }
+
+           message_del(TRANSLCD, MSG_SETTING, MSG_TO+system_station);
+        }
+
+       break;
+
+      case WAIT_FOR_MAIN_ARRIVE:
+         // inbound_carrier=TRUE;   // set flag to enable interrupt latch
+         // //arrivalEnable(ON);      // enable arrival interrupt NOT HERE
+
+         // Check for timeout
+         //if (MS_TIMER-state_timer >= DELIVER_TIMEOUT)
+         if (SEC_TIMER-translog.start_tm > deliveryTimeout)
+         {  message_add(TRANSLCD, MSG_ODUE, MSG_FROM+system_station, NEXT);
+            statistics.deliv_alarm++;
+            new_state=MALFUNCTION_STATE;
+            translog.malf_type=3; translog.malf_tm=SEC_TIMER;
+            //blower(OFF);
+         }
+
+         // check for doors opening
+         new_state=checkDoorWhileRunning(system_state);
+
+         // if tube arrived ...
+         if (di_carrierArrival || latchCarrierArrival)
+         {
+            //blower(OFF);
+            inUse(OFF, system_stationb);
+            //arrivalEnable(OFF);      // disable arrival interrupt
+            message_del(TRANSLCD, MSG_RETURN, MSG_FROM+system_station);
+            main_arrival=SEC_TIMER;   // set equal to current time
+            arrival_from|=system_stationb;
+            message_add(SYSTEMLCD, MSG_ARVALRT, MSG_AT, NEXT);
+            message_del(SYSTEMLCD, MSG_SYSBUSY, MSG_DONTUSE);
+
+            // print transaction data
+            statistics.trans_in++;
+            translog.end_tm = SEC_TIMER;
+            if (printlog_active) print_transaction(translog);
+
+            // notify destination of completion
+            finalcmd.command=TRANS_COMPLETE;
+            finalcmd.station=system_station;
+            finalcmd.data[0]=DIR_RETURN;
+            new_state=FINAL_COMMAND;
+            system_station=0;
+            system_stationb=0;
+         }
+
+         break;
+
+      case HOLD_TRANSACTION:      // serves both send and return
+       // restore send when both doors close
+       if (remote_data[REMOTE_DOOR] & system_stationb
+         && di_doorClosed)
+       {
+          // check if user inserted a new carrier while the door was open
+          XtraCic = FALSE;
+          if ((memory_state == WAIT_FOR_REM_ARRIVE) && di_carrierInChamber) XtraCic = TRUE;
+          if ((memory_state == WAIT_FOR_MAIN_ARRIVE) && (remote_data[REMOTE_CIC] & system_stationb)) XtraCic = TRUE;
+          if  (memory_state == WAIT_FOR_TURNAROUND)
+          {  if ((system_direction == DIR_SEND) && di_carrierInChamber) XtraCic = TRUE;
+             if ((system_direction == DIR_RETURN) && (remote_data[REMOTE_CIC] & system_stationb)) XtraCic = TRUE;
+          }
+          if (XtraCic)
+          {
+            // stay in the alert/alarm mode
+            if (FirstXtraCic)
+            {  print_event("EXTRA CARRIER INSERTED IN CHAMBER IN TRANSACTION FROM SOURCE");
+               FirstXtraCic=FALSE;
+            }
+          } else
+          {
+             if (system_direction==DIR_SEND)
+             {  //blower(blowerSend);
+             } else
+             {  //blower(blowerReturn);
+             }
+             new_state=memory_state;
+             do_alert(OFF);
+             // Turn off remote alert
+             command.lplc=ALL_LPLCS;
+             command.command=SET_OUTPUTS;
+             command.station=system_station;
+             command.data[devInUseSolid]=0;
+             command.data[devInUseFlash]=0;
+             command.data[devAlert]=0;
+             command.data[devAlarm]=0;
+             send_command(command);
+             print_event("TRANSACTION RESUMED");
+             FirstXtraCic=TRUE;
+          }
+       }
+
+       // Check for timeout
+       //if (MS_TIMER-state_timer >= DELIVER_TIMEOUT)
+       if (SEC_TIMER-translog.start_tm > deliveryTimeout)
+       {  new_state=MALFUNCTION_STATE;
+          statistics.deliv_alarm++;
+          translog.malf_type=3; translog.malf_tm=SEC_TIMER;
+       }
+
+       break;
+
+
+      case CANCEL_STATE:
+         // reset all outputs and return to normal
+         //blower(OFF);
+         inUse(OFF, system_stationb);
+         do_alert(OFF);
+         alarm(OFF);
+         //arrivalEnable(OFF);      // disable arrival interrupt
+
+        // clear lcd message
+        message_del(SYSTEMLCD, EMPTY, EMPTY);
+        message_del(TRANSLCD, EMPTY, EMPTY);
+
+        finalcmd.command=RESET;
+        finalcmd.station=0;
+        new_state=FINAL_COMMAND;
+        system_station=0;
+        system_stationb=0;
+        malfunctionActive=FALSE;
+
+        // turn off priority if it was on
+        priority = FALSE;
+        break;
+
+      case MALFUNCTION_STATE:
+        // signal alarm only per GW 4/14/93
+        if (malfunctionActive==FALSE)
+        {
+           inUse(OFF, ALL_STATIONS);
+           do_alert(OFF);
+           print_malfunction( translog );
+        }
+        //arrivalEnable(OFF);      // disable arrival interrupt
+        alarm(ON);
+        // turn off priority if it was on
+        priority = FALSE;
+        // signal alarm at remote per GW 4/14/93
+        command.lplc=ALL_LPLCS;
+        command.command=MALFUNCTION;
+        command.station=system_station;
+        send_command(command);
+
+        // put up lcd message
+        message_add(SYSTEMLCD, MSG_ALARM, MSG_ALARM+1, NOW);
+        malfunctionActive=TRUE;
+        //}
+
+        break;
+
+      case FINAL_COMMAND:
+         // set the command before entering this state
+         // remains in this state until command received or timeout
+         finalcmd.lplc=ALL_LPLCS;
+         if (send_command(finalcmd))
+         {
+            new_state=IDLE_STATE;
+            if (finalcmd.command==TRANS_COMPLETE) incrementCounter();
+            // turn off priority if it was on
+            priority = FALSE;
+         }
+
+         // check timeout
+         if (MS_TIMER-state_timer >= 1000) new_state=IDLE_STATE;
+
+         break;
+
+      default:
+         // unknown state, execute cancel code
+         new_state=CANCEL_STATE;
+   }
+
+   // if state change, reset state timer
+   if (new_state != system_state)
+   {
+      // set blower for new state
+      blower(blowerStateTable[new_state][blwrConfig]);
+      state_timer=MS_TIMER;
+      system_state=new_state;
+      first_time_here=TRUE;    // wasn't here yet
+   }
+   else first_time_here=FALSE; // were already here
+
+
+}
+
+char checkDoorWhileRunning(char calling_state)
+{  // Check for main or remote doors opening
+   struct iomessage command;
+   char event_string[80];     // line to send to the printer
+   char rtnval;
+
+   rtnval = calling_state;  // return same state by default
+
+   // check for main station door opening
+   if (!di_doorClosed)
+   {
+	   do_alert(ON);
+	   rtnval=HOLD_TRANSACTION;
+	   memory_state=calling_state;
+	   strcpy(event_string, "DOOR OPEN IN TRANSACTION (#) ");
+      event_string[26] = 97+calling_state;
+	   strcat(event_string, sys_message[MSG_AT].msg);
+	   print_event(event_string);
+      //st_time_diff = MS_TIMER - st_timer; // hold transfer timeout
+      //message_add(SYSTEMLCD, MSG_SYSALARM, MSG_DOOR_OPEN, NOW);
+      //door_warning = TRUE;
+   }
+   // check for remote station door opening
+   if (~remote_data[REMOTE_DOOR] & system_stationb)
+   {
+      do_alert(ON);
+      // Turn on remote alert
+      command.lplc=ALL_LPLCS;
+      command.command=SET_OUTPUTS;
+      command.station=system_station;
+      command.data[devInUseSolid]=0;
+      command.data[devInUseFlash]=0;
+      command.data[devAlert]=system_stationb;
+      command.data[devAlarm]=0;
+      send_command(command);
+      rtnval=HOLD_TRANSACTION;
+      memory_state=calling_state;
+      strcpy(event_string, "DOOR OPEN IN TRANSACTION (#) ");
+      event_string[26] = 97+calling_state;
+      strcat(event_string, sys_message[MSG_AT+system_station].msg);
+      print_event(event_string);
+      //st_time_diff = MS_TIMER - st_timer; // hold transfer timeout
+      //message_add(SYSTEMLCD, MSG_SYSALARM, MSG_DOOR_OPEN, NOW);
+      //door_warning = TRUE;
+   }
+
+   return rtnval;
+}
+
+char processKeyInput()
+{
+   char inKey;
+//   static unsigned long CO2Running;
+
+   inKey = getKey();
+   //if (inKey > 0) printf("%c\n", inKey);
+
+   //if (functionButton(FUNC_BUTT, FUNC_TRIG))
+   switch (inKey)
+   {
+   case KEYMENUNEXT:
+      if ( (system_state == IDLE_STATE) || (system_state == MALFUNCTION_STATE) )
+      {  // Enter function mode
+         enterSetupMode(0, &system_state);
+      } else
+      { // display message how to reset system
+         message_add(TRANSLCD, MSG_FUNCTION, MSG_SYSBUSY, ONESHOT);
+         message_add(SYSTEMLCD, MSG_SYSBUSY+1, MSG_SYSBUSY+2, ONESHOT);
+      }
+      break;
+
+   case KEYAUTOMAN:
+      break;
+
+   case KEYAUTOPURGE:
+      break;
+
+   case KEYADDC02:
+      break;
+   }
+
+   return inKey;
+}
+
+void showactivity()
+{
+   // update active processor signal
+   ledOut(0, (MS_TIMER %500) < 250);  // on fixed frequency
+   ledOut(1, (MS_TIMER %500) > 250);  // off fixed frequency
+   toggleLED(2);                      // toggle each call
+}
+void toggleLED(char LEDDev)
+{
+   static char LEDState[4];
+
+   // if LEDDev not 0..3 then initialize LED states off
+   if (LEDDev > 3)
+   {  LEDState[0]=0; LEDState[1]=0; LEDState[2]=0; LEDState[3]=0;
+   }
+   else
+   {
+      LEDState[LEDDev] ^= 1;               // toggle LED state on/off
+      ledOut(LEDDev, LEDState[LEDDev]);    // send LED state
+   }
+}
+int checkSystemSafeties(void)
+{  // Look at various inputs to make sure the system is operating normal
+   // Checks: C02 level, C02 Pressure Switch, Shop Air Pressure Switch
+   //         Isolation Valve Position, Blower Ok Switch
+   //         Connection status to RN1100 digital I/O
+   // Output is low-bit-good
+   //    Warnings in low byte (0x00FF)
+   //         CO2 level (0x0001), CO2 pressure switch (0x0002)
+   //    Alarms in high byte (0xFF00)
+   //         Shop air (0x0100), Iso valves (0x0200), Blower ok switch (0x0400), Fume hood on (0x0800)
+
+   int rtnval;
+   rtnval=0;
+
+   // v2.18 only normal CO2 level check
+   // v2.19 no more co2 warnings
+   //if (!di_co2LevelGood)   rtnval |= 0x0001;
+	//if (param.lowCO2MsgInput==STDLOWINPUT)
+   //{  if (!di_co2LevelGood)   rtnval |= 0x0001;}
+   //else
+   //{  if (!di_co2LowLowLevel) rtnval |= 0x0001;}
+
+   return rtnval;
+}
+
+void displaySafetyStatus(int status)
+{  // show the state of the safety status information
+   static int lastStatus;
+   int changed;
+
+   // only update message when status changes
+   changed = status ^ lastStatus;
+   // V219 No more Low CO2 message
+//   if (changed & 0x0001)
+//   {  if (status & 0x0001) message_add(SYSTEMLCD, MSG_SYSWARNING, MSG_CO2LVLLOW, NEXT);
+//      else                 message_del(SYSTEMLCD, MSG_SYSWARNING, MSG_CO2LVLLOW);
+//   }
+
+   lastStatus = status;
+}
+
+/******************************************************************/
+// Blower Processing Routines
+/******************************************************************/
+// Interface definition
+// char blwrConfig;     // to become a parameter from eeprom
+// blwrConfig 0 = Standard blower
+// blwrConfig 1 = High capacity APU blower
+// #define blwrOFF  0
+// #define blwrIDLE 1
+// #define blwrVAC  2
+// #define blwrPRS  3
+//// void init_blower(void);
+// void blower(char blowerOperatingValue);  // use blwrOFF, blwrIDLE, blwrVAC, blwrPRS
+// char processBlower(void);
+// char blowerPosition(void);
+
+char processBlower()
+{}
+
+char blowerPosition()
+{}
+
+void blower(char request)
+{
+   /* if on_request and already on opposite direction, turn off first */
+   // Invert logic on output bits, now output bit 0 = off per v2.34.1
+   char how;
+   static char lastHow;
+
+   #GLOBAL_INIT
+   {  lastHow = 0;
+		blwrConfig = 0; // Later to become eeprom parameter
+   }
+
+   how = request;
+
+   // make sure correct parameter is used.  anything but VAC and PRS is OFF
+   if ((how != blwrVAC) && (how != blwrPRS)) how = blwrOFF;
+
+   // if going from one on-state to the other on-state then turn off first
+   if ((how != blwrOFF) && (lastHow != blwrOFF) && (how != lastHow))
+   {  // can't run in both directions at the same time
+      do_blowerPRS(OFF);
+      do_blowerVAC(OFF);
+      msDelay(100);                   /* wait a little while */
+   }
+
+   /* turn on appropriate bit */
+   if (how == blwrPRS)      do_blowerPRS(ON);
+   else if (how == blwrVAC) do_blowerVAC(ON);
+
+   // remember last setting
+   lastHow = how;
+
+   return;
+}
+// DIVERTER PROCESSING ROUTINES
+void setDiverterConfiguration()
+{
+   // diverter configuration set by diverter_config byte
+   // 0 = no local diverter; 1 = local diverter;
+
+   // sets up values in the diverter_map station array
+   // Array index is station # 1..7;
+   // Value is diverter address; leg 1 or 2 or 0=n/a
+
+   if (param.diverter_config == 0)
+   {  // All stations n/a
+      diverter_map[0] = 0; diverter_map[1] = 0;
+      diverter_map[2] = 0; diverter_map[3] = 0;
+      diverter_map[4] = 0; diverter_map[5] = 0;
+      diverter_map[6] = 0; diverter_map[7] = 0;
+
+   } else {
+      // Station 1..4 on diverter leg 1;   5..7 on leg 2
+      diverter_map[0] = 0; diverter_map[1] = 1;
+      diverter_map[2] = 1; diverter_map[3] = 1;
+      diverter_map[4] = 1; diverter_map[5] = 2;
+      diverter_map[6] = 2; diverter_map[7] = 2;
+   }
+}
+/******************************************************************/
+char divertersReady(char station)
+{  // Indicates if all local and remote diverters are set to
+   // the specified station position.  Returns TRUE or FALSE.
+
+   struct iomessage command, response;
+   char rtnval;
+
+   rtnval=FALSE;   // assign default value
+   command.lplc=ALL_LPLCS;
+   command.command=DIVERTER_STATUS;
+   command.station=station;
+   response.data[0]=0;
+   send_n_get(command, &response);
+   if ( ( (response.data[0] & STATION_SET)==STATION_SET)
+       && ( (di_diverterPos==diverter_map[station])
+             || (diverter_map[station]==0) ) )
+   {   rtnval=TRUE;  }
+
+   return rtnval;
+}
+/******************************************************************/
+void set_diverter(char station)
+{  /* Controls the setting of diverter positions
+      Return from this routine is immediate.  If diverter is not
+      in position, it is turned on and a timer started.
+
+      You MUST repeatedly call check_diverter() to complete processing
+      of the diverter control position
+   */
+
+   /* use mapping from station to diverter position */
+
+   if ((station>0) && (station<9))     // Valid station #
+   {
+      diverter_setting = diverter_map[station];    // mapped setting
+
+      // if position<>ANY (any=0) and not in position
+      if ((diverter_setting>0) && (diverter_setting!=di_diverterPos))
+      {
+         /* turn on diverter and start timer */
+         do_diverter(ON);
+         diverter_start_time = MS_TIMER + DIVERTER_TIMEOUT;
+         diverter_attention = TRUE;
+         // NOT USED IN MAIN diverter_station=station;
+      }
+   }
+   return;
+}
+/******************************************************************/
+void check_diverter()
+{  /* Poll type processing of diverter control system */
+   /* Allows other processes to be acknowleged when setting diverter */
+
+   if (diverter_attention)
+   {
+      if ((diverter_setting == di_diverterPos) || (MS_TIMER-diverter_start_time > DIVERTER_TIMEOUT))
+      {
+         // turn off diverter and clear status
+         do_diverter(OFF);
+         diverter_attention = FALSE;
+         // NOT USED IN MAIN: diverter_station=0;
+      }
+   }
+}
+
+//**************************************
+//   DIGITAL INPUT/OUTPUT FUNCTIONS
+//**************************************
+int readDigInput(char channel)
+{  // returns the state of digital input 0-39
+   // function supports inverted logic by assigning dio_ON and dio_OFF
+
+   char rtnval;
+
+   if (channel < 16)
+   {  // on-board inputs
+      rtnval = digIn(channel);
+   }
+   else
+   {  // rn1100 inputs
+      if (DevRN1100 != -1)
+         rn_digIn(DevRN1100, channel-16, &rtnval, 0);
+      else rtnval = 0;
+   }
+   // deal with logic inversion
+   if (rtnval) rtnval = dio_ON;
+   else        rtnval = dio_OFF;
+   return rtnval;
+}
+
+void setDigOutput(int channel, int value)
+{  // sets the state of digital output 0-23
+   // call with logic value (0=OFF, 1=ON)
+   // function is adapted to support inverted logic by assigning dio_ON and dio_OFF
+
+   int outval;
+   // check for logic inversion
+   if (value) outval = dio_ON;
+   else       outval = dio_OFF;
+
+   if (channel < 8)
+   {  // on-board outputs
+      digOut(channel, outval);
+   }
+   else
+   {  // rn1100 outputs
+      if (DevRN1100 != -1)
+         rn_digOut(DevRN1100, channel-8, outval, 0);
+   }
+}
+void alarm(char how)
+{
+   if (how)
+   {  // turn on light
+      do_alarmLight(how);
+      // if sound flag on, turn noise on, else off.
+      if (alarm_sound_flag) do_alarmSound(how);
+      else do_alarmSound(OFF);
+   }
+   else
+   {  // turn off light and sound
+      do_alarmSound(how);
+      do_alarmLight(how);
+   }
+
+   return;
+}
+
+void inUse(char how, char station_b)
+{	// Only sets the global flags
+   // Call Maintenance to actually turn on/off lights
+
+   if (how == ON)
+   {  /* solid on, flash off */
+      outputvalue[devInUseSolid] |= station_b & STATION_SET;
+      outputvalue[devInUseFlash] &= ~(station_b & STATION_SET);
+   }
+   else if (how == OFF)
+   {  /* solid off, flash off */
+      outputvalue[devInUseSolid] &= ~(station_b & STATION_SET);
+      outputvalue[devInUseFlash] &= ~(station_b & STATION_SET);
+   }
+   else if (how == FLASH)
+   {  /* solid off, flash on */
+      outputvalue[devInUseSolid] &= ~(station_b & STATION_SET);
+      outputvalue[devInUseFlash] |= station_b & STATION_SET;
+   }
+
+   return;
+}
+
+
+//**************************************
+//   KEYPAD INPUT FUNCTIONS
+//**************************************
+char getKey(void)
+{  // Return a key from the keypad
+   char wKey;
+   char gk;
+   static char last;
+
+   wKey = rn_keyGet(DevRN1600, 0);
+   // reset menu timeout every time a key is pressed
+   if (wKey) menu_timeout=SEC_TIMER + 60;
+   else
+   {  // no keypad key so look for request-to-send key
+	   gk = bit2station(di_requestToSend);
+      // return the key when the button is released
+	   if (gk==0 && last!=0)
+	   {  wKey=last;
+	      last=0;
+	      menu_timeout=SEC_TIMER + 60;
+	   } else
+	   {  last=gk;
+	   }
+   }
+   return wKey;
+}
+/*
+char getKey()
+{  // returns key value number as pressed on station select buttons
+   // or returns 0 if none.
+   char gk, last, rtnval;
+
+   gk = bit2station(di_requestToSend);
+   if (gk==0 && last!=0)
+   {  rtnval=last;
+      last=0;
+      menu_timeout=SEC_TIMER + 60;
+   } else
+   {  rtnval=0;
+      last=gk;
+   }
+   return rtnval;
+}
+*/
+
+char valid_send_request(char station_b)
+{
+   char ecode, stanum;
+   stanum = bit2station(station_b);
+   if (stanum > 0)
+   {
+      /* make sure local inputs are correct */
+      if (di_carrierInChamber && di_doorClosed)
+      {
+        ecode=0;    // good request
+      } else
+      {
+        ecode=2;    // door open or no carrier
+      }
+   } else ecode=1;   // no or multiple inputs
+
+   return ecode;
+}
+
+/*******************************************************/
+// transaction request queue functions
+#define queue_len 4
+struct trans_queue_type
+{
+    char source;
+    char dest;
+} trans_queue[queue_len];
+char queue_last;
+
+void queueAdd(char tsource, char tdest)
+{
+    // adds request to queue  USE BIT VALUES
+
+    char i;
+    char found;
+
+    // add only if source does not already exist .. otherwise replace
+    found=FALSE;
+    for (i=0; i<queue_len; i++)
+    {   if (trans_queue[i].source==tsource)
+        { // replace existing entry
+          trans_queue[i].dest = tdest;
+          found=TRUE;
+        }
+    }
+    if (found==FALSE)
+    {  // not found so add after last current entry
+       queue_last = (queue_last+1) % queue_len;
+       trans_queue[queue_last].source=tsource;
+       trans_queue[queue_last].dest=tdest;
+    }
+}
+
+void queueDel(char tsource, char tdest)
+{
+    // deletes request from queue
+    // call with (0,0) to initialize
+    char i;
+
+    if (tsource==0 && tdest==0)
+    {  for (i=0; i<queue_len; i++)
+       {  trans_queue[i].source=0;
+          trans_queue[i].dest=0;
+       }
+       queue_last=0;
+    } else // find specified entry and delete it
+    {  for (i=0; i<queue_len; i++)
+       {  if (trans_queue[i].source==tsource && trans_queue[i].dest==tdest)
+          {   trans_queue[i].source=0;
+              trans_queue[i].dest=0;
+              // decrement last if it is the current entry
+              if (queue_last==i) queue_last = (queue_last+queue_len-1) % queue_len;
+          }
+       }
+    }
+}
+
+void queueNext(char *tsource, char *tdest)
+{  // returns next queue entry
+
+   char i;
+   char found;
+
+   // start at last+1 until a non-zero entry or back to last
+
+   *tsource=0; *tdest=0;   // initialize to zero
+
+   found=FALSE;
+   i=queue_last;
+   do
+   {   // increment to next queue entry
+       i=(i+1) % queue_len;
+       if (trans_queue[i].source != 0)
+       {   // this must be it
+           *tsource=trans_queue[i].source;
+           *tdest=trans_queue[i].dest;
+           found=TRUE;
+       }
+   } while (found==FALSE && i!=queue_last);
+}
+
+char queueVerify(char cic_data, char door_data)
+{
+    // step through each queue entry and kill if no carrier or door open
+    // returns bit set of each station in queue (to flash in-use)
+
+    char i;
+    char rtnval;
+
+    rtnval=0;
+    for (i=0; i<queue_len; i++)
+    { if (trans_queue[i].source != 0)  // if valid queue entry
+      {
+        if ((trans_queue[i].source & cic_data & door_data) == 0)
+        {   // kill it ... no more carrier or door is open
+            queueDel(trans_queue[i].source, trans_queue[i].dest);
+        } else
+        {   // include these bits in return val
+            rtnval |= trans_queue[i].source | trans_queue[i].dest;
+        }
+      }
+    }
+    return rtnval;
+}
+
+
+//**************************************
+//   LCD MESSAGE FUNCTIONS
+//**************************************
+static unsigned long msgtimer;
+struct queue
+{  char curentry;
+   char cursize;
+   char line1[QUEUESIZE];
+   char line2[QUEUESIZE];
+} msgqueue[2];
+char oneshot[2][2];   // oneshot buffer [lcd][line]
+char currentmsg[2][2];  // current display message
+
+void message_del(char lcd, char msgline1, char msgline2)
+{
+   char k, l, loc;
+
+   if ( (lcd != 0) && (lcd != 1) ) return;      // invalid lcd#
+
+   if (msgline1==EMPTY)
+   {  // delete all messages, reinitialize queue
+      for (l=0; l<LCDCOUNT; l++)
+      {
+       for (k=0; k<QUEUESIZE; k++)
+       {  msgqueue[l].line1[k] = EMPTY;
+          msgqueue[l].line2[k] = EMPTY;
+       }
+       msgqueue[l].curentry = 0;
+       msgqueue[l].cursize = 0;
+       oneshot[l][0]=EMPTY;    // clear oneshot buffers
+       oneshot[l][1]=EMPTY;
+      }
+      message_show(NOW);
+      //
+   }
+   else
+   {  // remove message from queue
+      k=0;
+      while ( ((msgline1 != msgqueue[lcd].line1[k])
+          || ( (msgline2 != msgqueue[lcd].line2[k])
+          || (msgline2 == EMPTY) ))
+          && (k < QUEUESIZE-1) ) k++;
+
+      if ( (msgline1 == msgqueue[lcd].line1[k])
+       && ( (msgline2 == msgqueue[lcd].line2[k])
+       || (msgline2 == EMPTY) ) )
+      {
+       loc = k;
+       for (k=loc; k<QUEUESIZE-1; k++)
+       {  msgqueue[lcd].line1[k] = msgqueue[lcd].line1[k+1];
+          msgqueue[lcd].line2[k] = msgqueue[lcd].line2[k+1];
+       }
+       msgqueue[lcd].cursize--;                  // decrement current size
+       if (msgqueue[lcd].cursize==0) msgqueue[lcd].curentry=0;
+       msgqueue[lcd].line1[QUEUESIZE-1] = EMPTY; // insert empty entry at end
+       if (msgqueue[lcd].line1[ msgqueue[lcd].curentry ] == EMPTY)
+       {
+          msgqueue[lcd].curentry = 0;
+          message_show(NOW);   // show next
+       }
+       if (msgqueue[lcd].curentry == loc)
+          message_show(NOW);   // show next
+      }
+   }
+   return;
+}
+
+void message_add(char lcd, char msgline1, char msgline2, char how)
+{  int k;
+   // how = NOW       // show message immediately
+   // how = NEXT      // show message next
+   // how = ONESHOTA  // show message once first of 2 oneshots
+   // how = ONESHOT   // show message once right now
+
+   if ( (lcd != 0) && (lcd != 1) ) return;      // invalid lcd#
+
+   if (how==ONESHOT || how==ONESHOTA)
+   {  // show only once
+      oneshot[lcd][0]=msgline1;
+      oneshot[lcd][1]=msgline2;
+      if (how==ONESHOT) message_show(ONESHOT);
+      return;
+   }
+
+   // insert as next message if not already in queue
+   k=0;
+   if (msgqueue[lcd].cursize==0)
+   {  msgqueue[lcd].curentry=0;
+      msgqueue[lcd].line1[0] = msgline1;
+      msgqueue[lcd].line2[0] = msgline2;
+      msgqueue[lcd].cursize++;
+   }
+   else
+   {
+      while ( ( (msgline1 != msgqueue[lcd].line1[k])
+       || (msgline2 != msgqueue[lcd].line2[k]) )
+          && (k < QUEUESIZE-1) ) k++;
+      if ( (msgline1 != msgqueue[lcd].line1[k])
+        || (msgline2 != msgqueue[lcd].line2[k]) ) // must not be in q already
+      {  for (k=QUEUESIZE-2; k>msgqueue[lcd].curentry; k--)
+         {
+            msgqueue[lcd].line1[k+1] = msgqueue[lcd].line1[k]; // shift over
+            msgqueue[lcd].line2[k+1] = msgqueue[lcd].line2[k]; // shift over
+         }
+         msgqueue[lcd].line1[ msgqueue[lcd].curentry+1 ] = msgline1;
+         msgqueue[lcd].line2[ msgqueue[lcd].curentry+1 ] = msgline2;
+         msgqueue[lcd].cursize++;                     // increment current size
+      }
+      else return;      // no update if already in queue
+   }                       // fix queue when size=1 and not current
+   if ( (how == NOW ) || ( msgqueue[lcd].cursize==1 ) )
+   {  // make current now, otherwise update in time
+      message_show(NOW);
+   }
+   return;
+}
+
+void message_show(char how)
+{
+   char lcd, l1, l2, k;
+
+   if ( (how==NOW) || (how==ONESHOT) || (MS_TIMER - msgtimer >= SCROLLTIME) )
+   {  if (how != ONESHOT)
+      {
+        // index to next message (both lcds)
+        for (lcd=0; lcd<LCDCOUNT; lcd++)
+        {
+          if (msgqueue[lcd].cursize > 0)
+          {
+             k=msgqueue[lcd].curentry + 1;
+             while ((msgqueue[lcd].line1[k] == EMPTY)
+                    && (k != msgqueue[lcd].curentry))
+                   k=(k+1)%QUEUESIZE;
+             if (msgqueue[lcd].line1[k] != EMPTY) msgqueue[lcd].curentry = k;
+          }
+        }
+      }
+      msgtimer = MS_TIMER; // + SCROLLTIME;
+
+      // display messages
+      for (lcd=0; lcd<LCDCOUNT; lcd++)
+      {
+        if ((how==ONESHOT) && (oneshot[lcd][0] != EMPTY))
+        {
+          l1=oneshot[lcd][0];        // use oneshot buffer
+          l2=oneshot[lcd][1];
+          oneshot[lcd][0]=EMPTY;     // clear oneshot buffer
+        } else {                      // load regular message
+          l1=msgqueue[lcd].line1[ msgqueue[lcd].curentry ];
+          l2=msgqueue[lcd].line2[ msgqueue[lcd].curentry ];
+        }
+
+        if (l1==EMPTY)          // show default msg if empty queue
+        {  setTimeMessages(MSG_DATE_TIME, SEC_TIMER);  // default uses time message
+           if (lcd==TRANSLCD)
+           {  l1=MSG_TDEFAULT;
+              l2=MSG_TDEFAULT2;
+           }
+           else
+           {  l1=MSG_SDEFAULT;
+              l2=MSG_SDEFAULT2;
+           }
+        }
+        // check for timer message refresh before display
+        refresh_timer_message(l1);
+        refresh_timer_message(l2);
+
+        // double check message range before display
+        if ((l1>=0) && (l1<MSGCOUNT))
+        {  lcd_print(lcd, 0, sys_message[l1].msg);
+           currentmsg[lcd][0] = l1;
+        }
+        if ((l2>=0) && (l2<MSGCOUNT))
+        {  lcd_print(lcd, 1, sys_message[l2].msg);
+           currentmsg[lcd][1] = l2;
+        }
+      }
+   } /* else // else check for 1 second refresh of certain messages
+   {  for (lcd=0; lcd<LCDCOUNT; lcd++)
+      {
+         if (   (currentmsg[lcd][0] == MSG_EXPOSE_TIME)
+             || (currentmsg[lcd][0] == MSG_DECAY_TIME)
+             || (currentmsg[lcd][0] == MSG_DISPATCH_TIME) )
+         {  refresh_timer_message(currentmsg[lcd][0]);
+            lcd_print(lcd, 0, sys_message[currentmsg[lcd][0]].msg);
+         }
+         if (   (currentmsg[lcd][1] == MSG_EXPOSE_TIME)
+             || (currentmsg[lcd][1] == MSG_DECAY_TIME)
+             || (currentmsg[lcd][1] == MSG_DISPATCH_TIME) )
+         {  refresh_timer_message(currentmsg[lcd][1]);
+            lcd_print(lcd, 1, sys_message[currentmsg[lcd][1]].msg);
+         }
+      }
+   } */
+}
+void refresh_timer_message(char msg)
+{  // Update display of dynamic messages
+   // timer messages need to refresh every second
+
+   char lcd, line;
+   unsigned long timepar;
+
+   //switch (msg)
+   //{
+/*   case MSG_EXPOSE_TIME:
+      // count up or count down
+      if (op_mode == OPMODE_MANUAL) timepar = (MS_TIMER - exposure_start_time) / 1000;
+      else timepar = param.exposureTimer - (MS_TIMER - exposure_start_time)/1000;
+      sys_message[MSG_EXPOSE_TIME].msg[9]  = 48 + (sample_number / 10);
+      sys_message[MSG_EXPOSE_TIME].msg[10] = 48 + (sample_number % 10);
+      setTimeMessages(MSG_EXPOSE_TIME, timepar);
+      //lcd_print(lcd, line, sys_message[MSG_EXPOSE_TIME].msg);
+      break;
+*/
+   //}
+}
+
+void lcd_show_cursor(char lcd, char line, char pos)
+{  // Show or hide the lcd cursor
+   if (lcd >= LCDCOUNT)
+   {  rn_dispCursor(DevRN1600, RNDISP_CUROFF, 0);
+   } else
+   {
+      rn_dispCursor(DevRN1600, RNDISP_CURON, 0);
+      rn_dispGoto (DevRN1600, pos, line+lcd*2, 0);
+   }
+}
+void reset_msg_timer(void)
+{  msgtimer = MS_TIMER; // + SCROLLTIME;
+}
+void lcd_print(char lcd, char line, char* message)
+{
+    lputs(line+lcd*2, message);
+}
+void lputs(char line, char* msg)
+{
+   //char c;
+   rn_dispGoto(DevRN1600, 0, line, 0);
+   rn_dispPrintf (DevRN1600, 0, msg);
+   //for (c=0; c<MSG_LEN; c++) rn_dispPutc(DevRN1600, msg[c], 0);
+printf("%s \n", msg);
+}
+
+void lcd_initialize()
+{
+   rn_dispInit(DevRN1600, DISPROWS, DISPCOLS);
+   rn_dispPrintf (DevRN1600, 0, "Starting...");
+   rn_dispBacklight(DevRN1600, ON, 0); //turn on backlight
+   beep(2);
+//   msDelay(500);
+//   beep(10);
+   message_del(0, EMPTY, EMPTY);    // initialize both lcd queues
+
+}
+/******************************************************************/
+void initializeMessages(void)
+{  // Setup messages for lcd display
+
+   char j;
+
+   // load ram messages with contents of rom
+   for (j=0; j<MSGCOUNT; j++)
+       strcpy(sys_message[j].msg, sysmsg[j]);
+
+   // set station name messages
+   buildStationNames();
+}
+/******************************************************************/
+void buildStationNames()
+{
+   char j, k, start, mybuf[17];
+
+   // check if names are initialized
+    if (param.names_init != 69)      // init flag
+    {
+      // use default names
+      strcpy(param.station_name[0].name, "MAIN");
+      strcpy(param.station_name[1].name, "STATION 1");
+      strcpy(param.station_name[2].name, "STATION 2");
+      strcpy(param.station_name[3].name, "STATION 3");
+      strcpy(param.station_name[4].name, "STATION 4");
+      strcpy(param.station_name[5].name, "STATION 5");
+      strcpy(param.station_name[6].name, "STATION 6");
+      strcpy(param.station_name[7].name, "STATION 7");
+      strcpy(param.station_name[8].name, "SYSTEM 1");
+      param.names_init = 69;
+    }
+
+   // build station name messages
+   for (j=0; j<8; j++)
+   {
+     // clear out destinations
+     strcpy(sys_message[MSG_AT+j].msg, sys_message[MSG_BLANK].msg);
+     strcpy(sys_message[MSG_FROM+j].msg, sys_message[MSG_BLANK].msg);
+     strcpy(sys_message[MSG_TO+j].msg, sys_message[MSG_BLANK].msg);
+
+     strcpy(mybuf, "AT ");
+     strcat(mybuf, param.station_name[j].name);
+     // center message
+     start = (16 - strlen(mybuf)) / 2;
+     // place in destination
+     for (k=0; k<strlen(mybuf); k++)
+          sys_message[MSG_AT+j].msg[k+start]=mybuf[k];
+
+     strcpy(mybuf, "FROM ");
+     strcat(mybuf, param.station_name[j].name);
+     // center message
+     start = (16 - strlen(mybuf)) / 2;
+     // place in destination
+     for (k=0; k<strlen(mybuf); k++)
+          sys_message[MSG_FROM+j].msg[k+start]=mybuf[k];
+
+     strcpy(mybuf, "TO ");
+     strcat(mybuf, param.station_name[j].name);
+     // center message
+     start = (16 - strlen(mybuf)) / 2;
+     // place in destination
+     for (k=0; k<strlen(mybuf); k++)
+          sys_message[MSG_TO+j].msg[k+start]=mybuf[k];
+
+    }
+}
+char functionDefineStations()
+{  // define the active stations
+   // returns TRUE if activestations were changed
+   char rtsIn;
+   char done;
+   char j, col, msgbuf[17];
+   char original;
+   char inKey;
+
+   lcd_print(SYSTEMLCD, 0, sys_message[MSG_DEF_STATIONS].msg);
+   strcpy(msgbuf, sys_message[MSG_BLANK].msg);
+   lcd_print(SYSTEMLCD, 1, msgbuf);
+
+   original = STATION_SET;  // save for later
+   STATION_SET = 0xFF;      // to allow requestToSend to return any pushbutton
+   activeStations = 0;      // reset
+   if (param.turnaround_config==TRUE) activeStations |= 0x80;
+
+   done=FALSE;
+   // Loop until Func, F1, F2
+    while (done==FALSE)
+    {
+	     maintenance();  // watchdog, led activity, UDP commands
+        inKey = getKey();
+
+        // If Func or F1, save changes
+        if (functionButton(FUNC_BUTT, FUNC_TRIG)
+            || functionButton(FUNC_F1, FUNC_TRIG)
+            || inKey == KEYMENUNEXT
+            || inKey == '+' )
+        {
+            if (activeStations != STATION_SET)
+            {
+               //ee_wr(EE_STATION_SET, activeStations);
+               lcd_print(SYSTEMLCD, 1, "     SAVED      ");
+            }
+            else
+            {
+               lcd_print(SYSTEMLCD, 1, "   NO CHANGE    ");
+            }
+
+            STATION_SET = activeStations;
+            done=TRUE;
+        }
+
+        // If F2 cancel changes
+        if (functionButton(FUNC_F2, FUNC_TRIG)
+           || inKey == '-')
+        {
+           lcd_print(SYSTEMLCD, 1, "   NO CHANGE    ");
+           STATION_SET = original;
+           done=TRUE;
+        }
+
+        // If station button, include bit and show on display
+        rtsIn = firstBit(di_requestToSend);
+        if (rtsIn)
+        {  activeStations |= station2bit(rtsIn);
+           col = (rtsIn * 2) -1;
+           msgbuf[col] = 48 + rtsIn;
+           lcd_print(SYSTEMLCD, 1, msgbuf);
+        }
+
+    }
+    param.activeStations = STATION_SET;
+    if (STATION_SET == original) return FALSE;
+    else return TRUE;
+}
+/******************************************************************/
+void functionSetNames()
+{  // edit main & remote station names
+   char j, changed, row, col, msgbuf[17];
+   row=0;
+   changed=0;
+
+   lcd_print(SYSTEMLCD, 0, "F1=->  F2=CHANGE");
+   while (row < 9)  // row < number of names (0-n)
+   {
+      // display this station name
+      strcpy(msgbuf, param.station_name[row].name);
+      strncat(msgbuf, "                ", 16-strlen(msgbuf));
+      msgbuf[15]=0x30+row;  // display number
+      lcd_print(SYSTEMLCD, 1, msgbuf);
+
+      col=0;
+      lcd_show_cursor(SYSTEMLCD, 1, col);
+      while (!functionButton(FUNC_BUTT, FUNC_TRIG))
+      {
+         hitwd();                // hit the watchdog timer
+         showactivity();
+
+         // increment column position
+         if (functionButton(FUNC_F1, FUNC_TRIG))
+         {  col=(col+1) %11;
+            lcd_show_cursor(SYSTEMLCD, 1, col);
+         }
+         // increment character at [col] with auto repeat
+         if (functionButton(FUNC_F2, FUNC_TRIG)
+             || functionButton(FUNC_F2, FUNC_HELD))
+         {  msgbuf[col]++;
+            if (msgbuf[col]>127) msgbuf[col]=32;
+            lcd_print(SYSTEMLCD, 1, msgbuf);
+            lcd_show_cursor(SYSTEMLCD, 1, col);
+            changed=TRUE;
+         }
+      }
+
+      // trim spaces
+      j=12;
+      while (j>0) if (msgbuf[j]>32) { msgbuf[j+1]=0; j=0; } else --j;
+
+      // put name back into main storage
+      strcpy(param.station_name[row].name, msgbuf);
+      row++;  // next item
+   }
+   // rebuild station name messages
+   buildStationNames();
+}
+
+// time structure used in several of the following routines
+//struct tm time;
+void setCountMessage(void)
+{  // store long numeric value transactionCount into message buffer
+   char j, k, mybuf[MSG_LEN+1];
+   strcpy(sys_message[MSG_TRANS_COUNT].msg, sys_message[MSG_BLANK].msg);
+   ltoa(transactionCount(), mybuf);
+   // stuff mybuf into center of message
+   k=(MSG_LEN-strlen(mybuf))/2;
+   for (j=0; j<strlen(mybuf); j++)
+       sys_message[MSG_TRANS_COUNT].msg[j+k]=mybuf[j];
+}
+void setParValueMessage(char MSG_message, unsigned long par_value, char * par_units)
+{  // store long numeric value into message buffer
+   char j, k, mybuf[MSG_LEN+1];
+   // blank out existing message
+   strcpy(sys_message[MSG_message].msg, sys_message[MSG_BLANK].msg);
+   // convert value to string and append units text
+   ltoa(par_value, mybuf);
+   strcat(mybuf, " ");
+   strcat(mybuf, par_units);
+   // place mybuf and units text into center of message
+   k=(MSG_LEN-strlen(mybuf))/2;
+   for (j=0; j<strlen(mybuf); j++)
+       sys_message[MSG_message].msg[j+k]=mybuf[j];
+}
+// Define leader offset into messages (0 for 16 char lcd, 2 for 20 char lcd)
+#define MSG_OFFSET 0
+void setTimeMessages(char message, unsigned long timedate)
+{  // fills in the time and date into the sys_message messages
+   // timedate in seconds
+
+   struct tm time;
+   //char bad;
+   //bad=63;  // question mark
+   // convert unsigned long to time structure
+   mktm(&time, timedate);
+
+   //if ( tm_rd( &time ) )
+   //{       // error reading date/time
+   //} else
+   if (message == MSG_DATE_TIME)
+   {
+      // fill in the time values
+/*    FOR ORIGINAL TIME MESSAGE
+      sys_message[MSG_TIME].msg[MSG_OFFSET + 7] = 48 + (time.tm_hour / 10);
+      sys_message[MSG_TIME].msg[MSG_OFFSET + 8] = 48 + (time.tm_hour % 10);
+      sys_message[MSG_TIME].msg[MSG_OFFSET + 10] = 48 + (time.tm_min / 10);
+      sys_message[MSG_TIME].msg[MSG_OFFSET + 11] = 48 + (time.tm_min % 10);
+      //sys_message[MSG_TIME].msg[13] = 48 + (time.tm_sec / 10);
+      //sys_message[MSG_TIME].msg[14] = 48 + (time.tm_sec % 10);
+*/
+
+      // and second message
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 10] = 48 + (time.tm_hour / 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 11] = 48 + (time.tm_hour % 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 13] = 48 + (time.tm_min / 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 14] = 48 + (time.tm_min % 10);
+
+      // fill in the date values
+//      sys_message[MSG_DATE].msg[MSG_OFFSET + 7] = 48 + (time.tm_mon / 10);
+//      sys_message[MSG_DATE].msg[MSG_OFFSET + 8] = 48 + (time.tm_mon % 10);
+//      sys_message[MSG_DATE].msg[MSG_OFFSET + 10] = 48 + (time.tm_mday / 10);
+//      sys_message[MSG_DATE].msg[MSG_OFFSET + 11] = 48 + (time.tm_mday % 10);
+//      sys_message[MSG_DATE].msg[MSG_OFFSET + 13] = 48 + ((time.tm_year / 10) % 10);
+//      sys_message[MSG_DATE].msg[MSG_OFFSET + 14] = 48 + (time.tm_year % 10);
+
+      // and second message
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 1] = 48 + (time.tm_mon / 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 2] = 48 + (time.tm_mon % 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 4] = 48 + (time.tm_mday / 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 5] = 48 + (time.tm_mday % 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 7] = 48 + ((time.tm_year / 10) % 10);
+      sys_message[MSG_DATE_TIME].msg[MSG_OFFSET + 8] = 48 + (time.tm_year % 10);
+   }
+   else if (message == MSG_PAR_VALUE)
+   {
+      // fill in the time values
+      //sys_message[MSG_PAR_VALUE].msg = "    HH:MM:SS    ";
+      strcpy(sys_message[MSG_PAR_VALUE].msg, sys_message[MSG_BLANK].msg);
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 4] = 48 + (time.tm_hour / 10);
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 5] = 48 + (time.tm_hour % 10);
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 6] = ':';
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 7] = 48 + (time.tm_min / 10);
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 8] = 48 + (time.tm_min % 10);
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 9] = ':';
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 10] = 48 + (time.tm_sec / 10);
+      sys_message[MSG_PAR_VALUE].msg[MSG_OFFSET + 11] = 48 + (time.tm_sec % 10);
+   }
+
+}
+void setFlagMessage(char flag)
+{
+   // flag message is on or off
+   if (flag)
+   {  sys_message[MSG_FLAG_SET].msg[MSG_OFFSET + 12]=78;          // ON
+      sys_message[MSG_FLAG_SET].msg[MSG_OFFSET + 13]=32;
+   } else
+   {  sys_message[MSG_FLAG_SET].msg[MSG_OFFSET + 12]=70;          // OFF
+      sys_message[MSG_FLAG_SET].msg[MSG_OFFSET + 13]=70;
+   }
+}
+void show_extended_data()
+{  // display watchdog and powerlow resets on the lcd
+   char i;
+   char msgbuf[17];
+
+   lcd_print(SYSTEMLCD, 0, " REMOTE RESETS  ");
+   strcpy(msgbuf, "#n WD:___ PL:___");
+//   lcd_select(SYSTEMLCD);
+   for (i=1; i<8; i++)
+   {
+      if ( (1 << (i-1)) & ALL_LPLCS )  // if i is a remote lplc
+      {
+        //lcdcmd(LINE1);
+        msgbuf[1]=48+i;  // remote #
+        msgbuf[6]=48+(extendedData[i][0] / 100);
+        msgbuf[7]=48+((extendedData[i][0] / 10) % 10);
+        msgbuf[8]=48+(extendedData[i][0] % 10);
+        msgbuf[13]=48+(extendedData[i][1] / 100);
+        msgbuf[14]=48+((extendedData[i][1] / 10) %10);
+        msgbuf[15]=48+(extendedData[i][1] % 10);
+        lputs(0, msgbuf);
+        msDelay(2500);
+      }
+   }
+}
+
+char functionButton(char which_button, char how)
+{  // which_button    0=[Function], 1=[F1], 2=[F2]
+   // how             1=triggered (latched), 2=current state, 3=held
+   // call functionButton(0,0) to initialize/reset
+
+   char rtnval;
+   static char button_up;
+   static char triggered[3];
+   static unsigned long held[3];
+   #define PUSHED 0
+
+   #GLOBAL_INIT
+   {  for (button_up=0; button_up<3; button_up++)
+      {  triggered[button_up]=FALSE;
+         held[button_up]=0;
+      }
+   }
+
+   rtnval=FALSE;
+   // read button input (PUSHED = 0)
+   button_up = di_pushButton(which_button);
+   if (button_up!=PUSHED) held[which_button]=0;  // clear
+
+   switch (how)
+   {
+   case FUNC_TRIG:                   // triggered mode (latched)
+      // return true on button release
+      if (button_up==PUSHED)       // button pushed but not released
+      {  triggered[which_button]=TRUE;
+      }
+      else if (triggered[which_button]==TRUE)
+      {  // button was pushed, and now it is released
+         rtnval=TRUE;
+         triggered[which_button]=FALSE;
+      }
+      break;
+   case FUNC_HELD:
+      // auto repeat at rate, after delay
+      if (button_up==PUSHED)       // button pushed
+      {  if (held[which_button]==0)
+         {  held[which_button]=MS_TIMER;  }
+         else
+         {  if (MS_TIMER - held[which_button] > FUNC_DELAY)
+            {  rtnval=TRUE;
+               held[which_button] = MS_TIMER;
+            }
+         }
+      }
+      break;
+   default:       // return input value directly (true or false)
+      if (button_up==PUSHED) rtnval=TRUE;
+      break;
+   }
+
+   // reset menu timeout every time a key is pressed
+   if (rtnval) menu_timeout=SEC_TIMER + 60;
+
+   return rtnval;
+}
+
+unsigned long transaction_count;
+static unsigned long transCountXaddr;			// physical memory address
+/*******************************************************/
+unsigned long transactionCount() { return transaction_count; }
+/*******************************************************/
+nodebug void incrementCounter()
+{
+   transaction_count++;
+   setCountMessage();
+   root2xmem( transCountXaddr, &transaction_count, 4);
+}
+
+/*******************************************************/
+void loadTransactionCount()
+{
+   transCountXaddr = xalloc(32);
+   // Read transaction counter
+   xmem2root( &transaction_count, transCountXaddr, 4);
+
+   if (transaction_count < 0 || transaction_count > 1000000000)
+   { resetTransactionCount(); }
+
+   setCountMessage();
+}
+/******************************************************************/
+void resetTransactionCount()
+{  transaction_count=0;
+   setCountMessage();
+   root2xmem( transCountXaddr, &transaction_count, 4);
+}
+
+/******************************************************************/
+// MAKING DESIGN ASSUMPTION --> MNU_xxx value is the same as the index in menu[]
+// define menu item numbers
+enum MenuItems {
+	   MNU_ARRIVAL_SOUND,
+	   MNU_ALARM_SOUND,
+	   MNU_PURGE,
+	   MNU_ALARM_RESET,
+	   MNU_SET_CLOCK,
+	   MNU_SET_HOURS,
+	   MNU_SET_MINUTES,
+      MNU_SET_SECONDS,
+	   MNU_SET_DAY,
+	   MNU_SET_MONTH,
+	   MNU_SET_YEAR,
+	   MNU_COMM_STAT,
+	   MNU_MSTACKING,
+	   MNU_RSTACKING,
+	   MNU_RESET_COUNT,
+	   MNU_SET_STANAMES,
+	   MNU_PRINT_SUMMARY,
+	   MNU_LOG2PRINTER,
+	   MNU_DIVERTER_CFG,
+	   MNU_SETPASSWORD,
+	   MNU_SETTIMEOUT,
+	   MNU_TURNAROUND,
+	   MNU_RMTALRTSTAT,
+	   MNU_AUTO_PURGE,
+	   MNU_AUTOPUR_TIMER,
+	   MNU_DEF_STATIONS,
+      MNU_ADVANCED_SETUP,
+      MNU_RESET,
+	   MNU_LAST
+};
+
+// Define bitmasks for activation of menu items
+#define MNU_ADV  0x0E
+#define MNU_STD  0x01
+#define MNU_ALRM 0x10
+#define MNU_NONE 0x00
+// Define parameter types
+#define MNU_FLAG 01
+#define MNU_VAL  02
+#define MNU_TIME 03
+#define MNU_CLK  04
+#define MNU_OTHR 05
+// define parameter menu
+char NOch;       // dummy character place holder
+const struct{
+   char item;   // menu item
+   char usage;  // when available to the user
+   char msg1;   // line 2 message
+   char msg2;   // line 3 message
+   char msg3;   // line 4 message
+   char partype;  // parameter type (flag, clock, integer value, other)
+   char *parval;  // parameter value
+   char min;       // parameter minimum
+   char max;       // parameter maximum
+   char units[4];  // parameter units display
+   } menu[] = {
+ MNU_ARRIVAL_SOUND,  MNU_STD,  MSG_ARRIVE_SND, MSG_ON_OFF,      MSG_FLAG_SET,  MNU_FLAG, &arrival_sound_flag, 0, 0, "",
+ MNU_ALARM_SOUND,    MNU_ALRM, MSG_ALARM_SND,  MSG_ON_OFF,      MSG_FLAG_SET,  MNU_FLAG, &alarm_sound_flag, 0, 0, "",
+ MNU_PURGE,          MNU_STD|MNU_ALRM,  MSG_PURGE,      MSG_YES_NO,      MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_ALARM_RESET,    MNU_ALRM, MSG_ALARM_RESET, MSG_RESET,      MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_SET_CLOCK, 		MNU_STD,  MSG_SET_CLOCK,  MSG_YES_NO,      MSG_DATE_TIME, MNU_CLK,  &NOch, 0, 0, "",
+ MNU_SET_HOURS,      MNU_NONE, MSG_SET_CLOCK,  MSG_SET_HOURS,   MSG_DATE_TIME, MNU_CLK,  &NOch, 0, 0, "",
+ MNU_SET_MINUTES,    MNU_NONE, MSG_SET_CLOCK,  MSG_SET_HOURS+1, MSG_DATE_TIME, MNU_CLK,  &NOch, 0, 0, "",
+ MNU_SET_SECONDS,    MNU_NONE, MSG_SET_CLOCK,  MSG_SET_HOURS+2, MSG_DATE_TIME, MNU_CLK,  &NOch, 0, 0, "",
+ MNU_SET_DAY,        MNU_NONE, MSG_SET_CLOCK,  MSG_SET_HOURS+3, MSG_DATE_TIME, MNU_CLK,  &NOch, 0, 0, "",
+ MNU_SET_MONTH,      MNU_NONE, MSG_SET_CLOCK,  MSG_SET_HOURS+4, MSG_DATE_TIME, MNU_CLK,  &NOch, 0, 0, "",
+ MNU_SET_YEAR,       MNU_NONE, MSG_SET_CLOCK,  MSG_SET_HOURS+5, MSG_DATE_TIME, MNU_CLK,  &NOch, 0, 0, "",
+ MNU_COMM_STAT,      MNU_ADV,  MSG_SHOW_COMM,  MSG_YES_NO,      MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_MSTACKING,      MNU_ADV,  MSG_MSTACKING,  MSG_ON_OFF,      MSG_FLAG_SET,  MNU_FLAG, &param.stacking_ok[0], 0, 0, "",
+ MNU_RSTACKING,      MNU_ADV,  MSG_RSTACKING,  MSG_ON_OFF,      MSG_FLAG_SET,  MNU_FLAG, &param.stacking_ok[1], 0, 0, "",
+ MNU_RESET_COUNT,    MNU_ADV,  MSG_RESET_COUNT, MSG_YES_NO,     MSG_TRANS_COUNT,MNU_OTHR,&NOch, 0, 0, "",
+ MNU_SET_STANAMES,   MNU_ADV,  MSG_SET_STANAMES, MSG_YES_NO,    MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_PRINT_SUMMARY,  MNU_NONE, MSG_BLANK,       MSG_YES_NO,     MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_LOG2PRINTER,    MNU_NONE, MSG_LOG2PRINTER, MSG_ON_OFF,     MSG_FLAG_SET,  MNU_FLAG, &NOch, 0, 0, "",
+ MNU_DIVERTER_CFG,   MNU_ADV,  MSG_LOCALDIVERTER, MSG_ON_OFF,   MSG_FLAG_SET,  MNU_FLAG, &param.diverter_config, 0, 0, "",
+ MNU_SETPASSWORD,    MNU_ADV,  MSG_SETPASSWORD, MSG_SETCLEAR,   MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_SETTIMEOUT,     MNU_ADV,  MSG_SET_TIMEOUT, MSG_INC_DEC,    MSG_PAR_VALUE, MNU_VAL,  (char *)&param.deliveryTimeout, 10, 240, "SEC",
+ MNU_TURNAROUND,     MNU_ADV,  MSG_TURNAROUND,  MSG_ON_OFF,     MSG_FLAG_SET,  MNU_FLAG, &param.turnaround_config, 0, 0, "",
+ MNU_RMTALRTSTAT,    MNU_ADV,  MSG_RMTALRTSTAT, MSG_ON_OFF,     MSG_FLAG_SET,  MNU_FLAG, &param.remote_stat_alert, 0, 0, "",
+ MNU_AUTO_PURGE,     MNU_ADV,  MSG_AUTO_PURGE,  MSG_YES_NO,     MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_AUTOPUR_TIMER,  MNU_ADV,  MSG_AUTO_PURGE,  MSG_INC_DEC,    MSG_PAR_VALUE, MNU_VAL,  (char *)&param.autoPurgeTimer, 10, 200, "SEC",
+ MNU_DEF_STATIONS,   MNU_ADV,  MSG_DEF_STATIONS, MSG_YES_NO,    MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_ADVANCED_SETUP, MNU_STD,  MSG_ADV_SETUP,   MSG_ON_OFF,     MSG_FLAG_SET,  MNU_FLAG, &diagnostic_mode, 0, 0, "",
+ MNU_RESET,          MNU_ADV,  MSG_RESET+2,     MSG_RESET,      MSG_BLANK,     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_LAST,           MNU_NONE, MSG_END_OF_MENU, MSG_BLANK,      MSG_BLANK,     MNU_NONE, &NOch, 0, 0, "" };
+
+/******************************************************************/
+void enterSetupMode(char menu_flag, char *sys_state)
+{
+   char func_mode, write_clock, last_item; //, menu[20];
+   char menu_idx;
+   char inKey;
+   char par_changed;
+   unsigned long temp_ulong;
+   unsigned long *ptr_ulong;
+   unsigned long clock_in_seconds;
+   struct tm time;
+   write_clock=FALSE;
+   func_mode=TRUE;
+   par_changed=0;
+
+   // check password
+   if ((verifyPassword() == 1) || diagnostic_mode)
+   { // good password, ok to continue
+
+      // Setup the menu selection flag
+      menu_flag = MNU_STD;
+      if (diagnostic_mode) menu_flag |= MNU_ADV;   // include std and advanced
+      if (*sys_state==MALFUNCTION_STATE) menu_flag=MNU_ALRM;
+
+      // set and increment the menu number
+      menu_idx = 0;
+      while ((menu[menu_idx].item != MNU_LAST) && ((menu[menu_idx].usage & menu_flag) == 0))
+      {  menu_idx++;
+      }
+
+      // display first menu item
+      displayFunctionMessage(menu_idx, 0, 0);
+
+      // clear keypad input buffer
+      while (getKey());
+
+      // Initialize 60 second menu timeout
+      menu_timeout = SEC_TIMER + 60;
+
+      while ( (func_mode) && !secTimeout(menu_timeout) && (menu[menu_idx].item != MNU_LAST))
+      {
+         maintenance();  // watchdog, led activity, UDP commands
+         //processOutputLamps(OPERATE);
+         inKey = getKey();
+
+         if (inKey == KEYMENUNEXT)
+         //if (functionButton(FUNC_BUTT, FUNC_TRIG))
+         {  // increment menu item & show message
+            menu_idx = nextMenuItem(menu_idx, menu_flag);
+         }
+         // Check immediate mode menu items
+         if (menu[menu_idx].partype == MNU_VAL)
+         {  temp_ulong = (unsigned long)*menu[menu_idx].parval;  // cast into ulong value
+            par_changed |= functionSetParValue(menu[menu_idx].item, &temp_ulong,
+                           menu[menu_idx].min, menu[menu_idx].max, menu[menu_idx].units);
+            *menu[menu_idx].parval = (char)temp_ulong;
+            menu_idx = nextMenuItem(menu_idx, menu_flag);
+         }
+
+         if (inKey == '+')
+         //if (functionButton(FUNC_F1, FUNC_TRIG))
+         {
+            switch (menu[menu_idx].partype)
+            {
+            case MNU_FLAG:
+               if (menu[menu_idx].item==MNU_ADVANCED_SETUP)
+               {  if (di_requestToSend)
+	               {  *menu[menu_idx].parval = ON;
+	                  // par_changed = TRUE;  dont need to write to flash
+                  }
+               }
+               else
+               {
+	               *menu[menu_idx].parval = ON;
+   	            par_changed = TRUE;
+               }
+               break;
+            case MNU_TIME:
+               ptr_ulong = (unsigned long *)menu[menu_idx].parval;
+               par_changed |= functionSetTime(menu[menu_idx].item, menu_idx, ptr_ulong);
+               menu_idx = nextMenuItem(menu_idx, menu_flag);
+               break;
+            case MNU_CLK:
+               clock_in_seconds = SEC_TIMER;
+               par_changed |= functionSetTime(MNU_SET_CLOCK, menu_idx, &clock_in_seconds);
+               mktm(&time, clock_in_seconds);
+               tm_wr(&time);
+               SEC_TIMER = mktime(&time);    // required for tm_rd
+               menu_idx = nextMenuItem(menu_idx, menu_flag);
+               break;
+            case MNU_OTHR:
+            {  switch (menu[menu_idx].item)
+               {
+               case MNU_ALARM_RESET:           // alarm reset
+                  *sys_state=CANCEL_STATE;
+                  func_mode=FALSE;
+                  break;
+               case MNU_PURGE:                // purge system
+                  purgeSystem(0);             // 0 = manual; 1 = auto
+                  menu_idx = nextMenuItem(menu_idx, menu_flag);
+                  break;
+               case MNU_AUTO_PURGE:           // purge system
+                  purgeSystem(1);             // 0 = manual; 1 = auto
+                  menu_idx = nextMenuItem(menu_idx, menu_flag);
+                  break;
+               case MNU_RESET_COUNT:
+                  //transactionCount=0;
+                  resetTransactionCount();
+                  setParValueMessage(MSG_TRANS_COUNT, transactionCount(), "");
+                  lcd_print(SYSTEMLCD, 1, "      CLEARED       ");
+                  par_changed = TRUE;
+                  msDelay(500);
+                  menu_idx = nextMenuItem(menu_idx, menu_flag);
+                  break;
+               case MNU_SET_STANAMES:        // set station names
+                  functionSetNames();
+                  msDelay(1000);  				// hold on a little bit
+                  par_changed = TRUE;
+                  menu_idx = nextMenuItem(menu_idx, menu_flag);
+                  break;
+               case MNU_DEF_STATIONS:			// define active stations
+	               par_changed = functionDefineStations();
+                  menu_idx = nextMenuItem(menu_idx, menu_flag);
+               	break;
+               case MNU_SETPASSWORD:        // set new password
+                  par_changed = setPassword();
+                  msDelay(1000);  			  // hold on a little bit
+                  menu_idx = nextMenuItem(menu_idx, menu_flag);
+                  break;
+               case MNU_COMM_STAT:
+	               show_comm_test();
+	               func_mode=FALSE;
+               	break;
+               case MNU_RESET:
+                  // go into long loop to allow watchdog reset
+	               clock_in_seconds = SEC_TIMER;
+                  lcd_print(1, 0, "WAITNG FOR RESET");
+                  while (SEC_TIMER - clock_in_seconds < 5);
+                  lcd_print(1, 0, "UNABLE TO RESET ");
+                  msDelay(1000);
+                  break;
+               //case MNU_IO_CONTROL:
+               //   manualIOControl();
+               //   menu_idx = nextMenuItem(menu_idx, menu_flag);
+               //   break;
+               }
+            }
+            }
+            displayFunctionMessage(menu_idx, 0, 0);
+         } // end if f1
+
+         if (inKey == '-')
+         //if (functionButton(FUNC_F2, FUNC_TRIG))
+         {
+            if (menu[menu_idx].msg2 == MSG_YES_NO)
+               menu_idx = nextMenuItem(menu_idx, menu_flag);
+            else
+            switch (menu[menu_idx].partype)
+            {
+            case MNU_FLAG:
+               *menu[menu_idx].parval = OFF;
+               if (menu[menu_idx].item != MNU_ADVANCED_SETUP) par_changed = TRUE;
+               break;
+            case MNU_TIME:
+            case MNU_CLK:
+               menu_idx = nextMenuItem(menu_idx, menu_flag);
+               break;
+            case MNU_OTHR:
+            {  switch (menu[menu_idx].item)
+               {
+	            case MNU_SETPASSWORD:        // clear password
+	                  clearPassword();
+	                  msDelay(1000);  // hold on a little bit
+	                  par_changed = TRUE;
+	                  menu_idx = nextMenuItem(menu_idx, menu_flag);
+	                  break;
+               }
+//            default:                    // skip all other entries
+//               menu_item++;
+//               break;
+            }
+            }
+            displayFunctionMessage(menu_idx, 0, 0);
+         } // end if f2
+      } // end while
+
+      // Save parameters if changed
+      if (par_changed)
+      {  // Save
+         lcd_print(SYSTEMLCD, 0, "SAVING CHANGES...   ");
+         if (writeParameterSettings() == 0)
+            lcd_print(SYSTEMLCD, 1, "CHANGES SAVED       ");
+         else
+            lcd_print(SYSTEMLCD, 1, "ERROR SAVING CHANGES");
+      }
+
+      // Turn off lcd cursor
+      lcd_show_cursor(LCDCOUNT, 0, 0);
+
+   } // end if good password
+   else
+   {
+      lcd_print(SYSTEMLCD, 1, " ACCESS DENIED! ");
+      msDelay(1000);  // hold on a little bit
+   }
+
+}
+char nextMenuItem(char idx, char flag)
+{  // Step to the next valid menu item or {EOL}
+
+   idx++;
+   while ((menu[idx].item != MNU_LAST) && ((menu[idx].usage & flag) == 0)) idx++;
+   if (menu[idx].item != MNU_LAST)
+      displayFunctionMessage(idx, 0, 0);
+
+   return idx;
+}
+
+/******************************************************************/
+void displayFunctionMessage(char mnu_idx, char msg_item, char msg_value)
+{  // mnu_idx is the index to menu[]
+   // msgs correspond to display lines 3, 4
+   // if msg_item is zero, use .msg1, .msg2
+
+   unsigned long *ptr_ulong;
+   unsigned long val_ulong;
+
+   // display the menu message corresponding to the menu item
+   // update some dynamic messages first
+   switch (menu[mnu_idx].partype)
+   {
+   case MNU_FLAG:    // update flag message
+      setFlagMessage(*menu[mnu_idx].parval);
+      break;
+   case MNU_CLK:    // update clock message
+      setTimeMessages(MSG_DATE_TIME, SEC_TIMER);
+      break;
+   case MNU_TIME:   // update timer message
+      ptr_ulong = (unsigned long *)menu[mnu_idx].parval;
+      setTimeMessages(menu[mnu_idx].msg3, *ptr_ulong);
+      break;
+   case MNU_VAL:   // update parameter value message
+      val_ulong = (unsigned long)*menu[mnu_idx].parval;
+      setParValueMessage(MSG_PAR_VALUE, *menu[mnu_idx].parval, menu[mnu_idx].units);
+      break;
+   }
+
+   // display the messages
+   message_add(TRANSLCD, MSG_FUNCTION, menu[mnu_idx].msg1, ONESHOTA);
+   if (msg_item==0)
+      message_add(SYSTEMLCD, menu[mnu_idx].msg2, menu[mnu_idx].msg3, ONESHOT);
+   else
+      message_add(SYSTEMLCD, msg_item, msg_value, ONESHOT);
+
+}
+void manualIOControl()
+{  // manual control of I/O
+   char inKey;
+   char last_key;
+   char key_value;
+   char outputNum;
+   char outString[21];
+   char inString[21];
+   char refString[21];
+   char j;
+   inKey = 0;
+   outputNum = 0;
+   key_value = 0;
+
+   // set all outputs off??
+
+   // setup display
+   strcpy(outString, "OUT:0000000000000000");
+   strcpy(inString,  "INP:0000000000000000");
+   strcpy(refString, "00  0123456789012345");
+   lcd_print(TRANSLCD, 1, outString);
+   lcd_print(SYSTEMLCD, 0, refString);
+   lcd_print(SYSTEMLCD, 1, inString);
+
+   // process key loop
+   while ( inKey != KEYMENUNEXT  )
+   {
+      maintenance();  // watchdog, led activity, UDP commands
+      if (inKey > 0) last_key = inKey;
+      inKey = getKey();
+
+      if (inKey == '+')  // turn on output
+      {   // shift all digital outputs according to definition in the header
+          setDigOutput(key_value+do_shift, ON);
+          outString[key_value+4] = '1';
+      }
+      if (inKey == '-')  // turn off output
+      {   // shift all digital outputs according to definition in the header
+          setDigOutput(key_value+do_shift, OFF);
+          outString[key_value+4] = '0';
+      }
+
+      if ((inKey >= '0') & (inKey <= '9'))  // select different output
+      {
+         key_value = inKey - 48;  // convert from ascii to decimal
+         if ((last_key == '1') & (key_value <= 5))
+         {
+            key_value = key_value + 10;
+         }
+         refString[0] = 48 + key_value / 10;
+         refString[1] = 48 + key_value % 10;
+      }
+
+      // update display of inputs and outputs
+      for (j=0; j<=15; j++){ if (readDigInput(j)) inString[j+4] = '1'; else inString[j+4] = '0';}
+      lcd_print(TRANSLCD, 1, outString);
+      lcd_print(SYSTEMLCD, 0, refString);
+      lcd_print(SYSTEMLCD, 1, inString);
+
+   }
+   // reset some outputs
+   blower(blwrOFF);
+   //do_co2PurgeLamp(OFF);
+   //do_co2PurgeSystem(OFF);
+
+}
+// set clock functions
+char functionSetTime(char what_timer, char index, unsigned long *time_val)
+{  // what_timer is the base menu item
+   // index is ???
+   // *time_val contains the value of the time to be set
+   char menu_item, stmenu[6], cursor[6];
+   char inKey;
+   char clk_changed;
+   char msg_value;
+   char key_value;
+   char key_digit;
+   char key_valid;
+   struct tm time;
+   menu_item = 0;
+   clk_changed = 0;
+   key_digit = 10;
+   key_valid = FALSE;
+
+   if (what_timer == MNU_SET_CLOCK)
+   {
+      stmenu[0]=MNU_SET_MONTH;     cursor[0]=MSG_OFFSET + 2;
+      stmenu[1]=MNU_SET_DAY;       cursor[1]=MSG_OFFSET + 5;
+      stmenu[2]=MNU_SET_YEAR;      cursor[2]=MSG_OFFSET + 8;
+      stmenu[3]=MNU_SET_HOURS;     cursor[3]=MSG_OFFSET + 11;
+      stmenu[4]=MNU_SET_MINUTES;   cursor[4]=MSG_OFFSET + 14;
+      stmenu[5]=MNU_LAST;
+      msg_value=MSG_DATE_TIME;
+   } else
+   {
+      stmenu[0]=MNU_SET_HOURS;     cursor[0]=MSG_OFFSET + 5;
+      stmenu[1]=MNU_SET_MINUTES;   cursor[1]=MSG_OFFSET + 8;
+      stmenu[2]=MNU_SET_SECONDS;   cursor[2]=MSG_OFFSET + 11;
+      stmenu[3]=MNU_LAST;
+      msg_value=MSG_PAR_VALUE;
+      *time_val %= 86400;  // limit timers to 23:59:59
+   }
+   // convert time value to structure
+   mktm(&time, *time_val);
+
+   // MAKING DESIGN ASSUMPTION --> MNU_xxx value is the same as the index in menu[]
+   displayFunctionMessage(index, menu[stmenu[menu_item]].msg2, msg_value);
+   lcd_show_cursor(SYSTEMLCD, 1, cursor[menu_item]);
+
+   while ( (stmenu[menu_item] != MNU_LAST) && !secTimeout(menu_timeout) )
+   {
+      maintenance();  // watchdog, led activity, UDP commands
+      inKey = getKey();
+
+      // if FUNC/MODE (MENU/NEXT)
+      //if (functionButton(FUNC_BUTT, FUNC_TRIG))
+      if (inKey == KEYMENUNEXT)
+      {  // increment menu item
+         menu_item++;
+         // display the appropriate message
+         if (stmenu[menu_item] != MNU_LAST)
+         {  // update message display
+            setTimeMessages(msg_value, *time_val);
+            lcd_print(SYSTEMLCD, 0, sys_message[menu[stmenu[menu_item]].msg2].msg);
+            lcd_print(SYSTEMLCD, 1, sys_message[msg_value].msg);
+            lcd_show_cursor(SYSTEMLCD, 1, cursor[menu_item]);
+         }
+      }
+
+     // F1
+      //if (functionButton(FUNC_F1, FUNC_TRIG))
+      if (inKey == '+')
+      {
+         clk_changed = 1;
+         switch (stmenu[menu_item])
+         {
+         case MNU_SET_HOURS:             // increment hours
+            time.tm_hour=(time.tm_hour+1) % 24;
+            break;
+         case MNU_SET_MINUTES:           // increment minutes
+            time.tm_min=(time.tm_min+1) % 60;
+            break;
+         case MNU_SET_SECONDS:           // increment seconds
+            time.tm_sec=(time.tm_sec+1) % 60;
+            break;
+         case MNU_SET_DAY:               // increment day
+            time.tm_mday=(time.tm_mday % 31) +1;
+            break;
+         case MNU_SET_MONTH:             // increment month
+            time.tm_mon=(time.tm_mon % 12) +1;
+            break;
+         case MNU_SET_YEAR:              // increment year
+            if (time.tm_year<147) time.tm_year++;
+            break;
+         }
+         *time_val = mktime(&time);
+         setTimeMessages(msg_value, *time_val);
+         lcd_print(SYSTEMLCD, 1, sys_message[msg_value].msg);
+         lcd_show_cursor(SYSTEMLCD, 1, cursor[menu_item]);
+      }
+
+      // F2
+      //if (functionButton(FUNC_F2, FUNC_TRIG))
+      if (inKey == '-')
+      {
+         clk_changed = 1;
+         switch (stmenu[menu_item])
+         {
+         case MNU_SET_HOURS:             // decrement hours
+            time.tm_hour=(time.tm_hour+23) % 24;
+            break;
+         case MNU_SET_MINUTES:           // decrement minutes
+            time.tm_min=(time.tm_min+59) % 60;
+            break;
+         case MNU_SET_SECONDS:           // decrement seconds
+            time.tm_sec=(time.tm_sec+59) % 60;
+            break;
+         case MNU_SET_DAY:               // decrement day
+            time.tm_mday=((time.tm_mday+29) % 31) +1;
+            break;
+         case MNU_SET_MONTH:             // decrement month
+            time.tm_mon=((time.tm_mon+10) % 12) +1;
+            break;
+         case MNU_SET_YEAR:              // decrement year
+            if (time.tm_year>80) time.tm_year--;
+            break;
+         }
+         *time_val = mktime(&time);
+         setTimeMessages(msg_value, *time_val);
+         lcd_print(SYSTEMLCD, 1, sys_message[msg_value].msg);
+         lcd_show_cursor(SYSTEMLCD, 1, cursor[menu_item]);
+      }
+      if ((inKey >= '0') & (inKey <= '9'))
+      {
+         key_value = inKey - 48;  // convert from ascii to decimal
+         switch (stmenu[menu_item])
+         {
+         case MNU_SET_HOURS:             // increment hours
+            if ((key_digit == 10) & (key_value <= 2))
+            {
+               time.tm_hour = key_value * 10;
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_hour >= 20) & (key_value <= 3))
+            {
+               time.tm_hour = ((time.tm_hour / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_hour < 20))
+            {
+               time.tm_hour = ((time.tm_hour / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            break;
+         case MNU_SET_MINUTES:           // increment minutes
+            if ((key_digit == 10) & (key_value <= 5))
+            {
+               time.tm_min = key_value * 10;
+               key_valid = TRUE;
+            }
+            else if (key_digit == 1)
+            {
+               time.tm_min = ((time.tm_min / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            break;
+         case MNU_SET_SECONDS:           // increment seconds
+            if ((key_digit == 10) & (key_value <= 5))
+            {
+               time.tm_sec = key_value * 10;
+               key_valid = TRUE;
+            }
+            else if (key_digit == 1)
+            {
+               time.tm_sec = ((time.tm_sec / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            break;
+         case MNU_SET_DAY:               // increment day
+            if ((key_digit == 10) & (key_value <= 3))
+            {
+               time.tm_mday = key_value * 10;
+               if (time.tm_mday==0) time.tm_mday = 1;  // can't have zero
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_mday >= 30) & (key_value <= 1))
+            {
+               time.tm_mday = ((time.tm_mday / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_mday < 30))
+            {
+               time.tm_mday = ((time.tm_mday / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            break;
+         case MNU_SET_MONTH:             // increment month
+            if ((key_digit == 10) & (key_value <= 1))
+            {
+               time.tm_mon = key_value * 10;
+               if (time.tm_mon==0) time.tm_mon = 1;  // can't have zero
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_mon >= 10) & (key_value <= 2))
+            {
+               time.tm_mon = ((time.tm_mon / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_mon < 10))
+            {
+               time.tm_mon = ((time.tm_mon / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            break;
+         case MNU_SET_YEAR:              // increment year
+            if ((key_digit == 10) & (key_value <= 4))
+            {
+               time.tm_year = 100 + key_value * 10;
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_year >= 140) & (key_value <= 7))
+            {
+               time.tm_year = ((time.tm_year / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            else if ((key_digit == 1) & (time.tm_year < 140))
+            {
+               time.tm_year = ((time.tm_year / 10) * 10) + key_value;
+               key_valid = TRUE;
+            }
+            break;
+         }
+         // if valid key, increment position of cursor
+         if (key_valid == TRUE)
+         {  key_valid = FALSE;
+            clk_changed = 1;
+            if (key_digit == 10)
+               key_digit = 1;  // move from 10's to 1's
+            else
+            {  key_digit = 10; // move to next time component
+               menu_item++;
+            }
+            // Update time display
+            *time_val = mktime(&time);
+            setTimeMessages(msg_value, *time_val);
+            // blank 1's digit if 10's was just keyed in
+            if (key_digit == 1) sys_message[msg_value].msg[cursor[menu_item]] = 32;
+            lcd_print(SYSTEMLCD, 0, sys_message[menu[stmenu[menu_item]].msg2].msg);
+            lcd_print(SYSTEMLCD, 1, sys_message[msg_value].msg);
+            // Update and cursor
+            if (stmenu[menu_item] != MNU_LAST)
+               lcd_show_cursor(SYSTEMLCD, 1, cursor[menu_item]);
+         }
+      }
+   }
+   // put time back into time_val
+   *time_val = mktime(&time);
+   lcd_show_cursor(LCDCOUNT, 0, 0);  // turn off cursor
+   msDelay(500);  // allow time to show
+   return clk_changed;
+}
+char functionSetParValue(char menu_item, unsigned long * par_value,
+                         unsigned long par_min, unsigned long par_max,
+                         char * par_units)
+{  // allow changing an unsigned long parameter value
+   char j, col; //, msgbuf[17];
+   char inKey;
+   unsigned long original;
+   original = *par_value;
+
+   // update display
+   //displayFunctionMessage(menu_item);
+   //lcd_print(SYSTEMLCD, 0, sys_message[MSG_INC_DEC].msg);
+   //setParValueMessage(MSG_PAR_VALUE, *par_value, timerUnits);
+   //lcd_print(SYSTEMLCD, 1, sys_message[MSG_PAR_VALUE].msg);
+
+   //lcd_show_cursor(SYSTEMLCD, 1, col);
+
+   //while (!functionButton(FUNC_BUTT, FUNC_TRIG) && !secTimeout(menu_timeout) )
+   while ((inKey != KEYMENUNEXT) && !secTimeout(menu_timeout) )
+   {
+      maintenance();  // watchdog, led activity, UDP commands
+
+      inKey = getKey();
+      // increment parameter value
+      //if (functionButton(FUNC_F1, FUNC_TRIG))
+      if (inKey == '+')
+      {  if (*par_value < par_max)
+         {  (*par_value)++;
+         } else { *par_value = par_min; }
+         //displayFunctionMessage(menu_item);
+         setParValueMessage(MSG_PAR_VALUE, *par_value, par_units);
+         lcd_print(SYSTEMLCD, 1, sys_message[MSG_PAR_VALUE].msg);
+      }
+      // decrement parameter value
+      //if (functionButton(FUNC_F2, FUNC_TRIG))
+      if (inKey == '-')
+      {  if (*par_value > par_min)
+         {  (*par_value)--;
+         } else { *par_value = par_max; }
+         //displayFunctionMessage(menu_item);
+         setParValueMessage(MSG_PAR_VALUE, *par_value, par_units);
+         lcd_print(SYSTEMLCD, 1, sys_message[MSG_PAR_VALUE].msg);
+      }
+   }
+
+   // save if changed
+   if (*par_value != original)
+   {  return 1; } else {  return 0; }
+
+}
+/******************************************************************/
+// define purge system states
+#define  PURGE_GET_DIRECTION     0x21
+#define  PURGE_GET_STATION       0x22
+#define  PURGE_SET_DIVERTER      0x23
+#define  PURGE_WAIT_DIVERTER     0x24
+#define  PURGE_RUN               0x25
+#define  PURGE_GET_TURNAROUND    0X26
+#define  PURGE_RUN_DONE          0x27
+#define  PURGE_RUN_AUTO          0x28
+#define  PURGE_EXIT              0x29
+
+void purgeSystem(char auto_purge)
+{
+   // Input parameter 'how' is manual (0) or automatic (1)
+
+   struct iomessage command, response;
+   char purge_state, new_state, k, station_msg;
+   char mymessage[17];
+   //char k;  // loop counter
+   char remote_data_p[4];
+   char first_time_here;
+   char align_turnaround;
+   char blower_purge_state;   // used to tell turnaround blower what to do
+   char first_purge_state;    // initial state of the purge mode
+   char auto_station;
+   char auto_blower;
+   unsigned long ms_autoPurgeTimer;
+   ms_autoPurgeTimer = autoPurgeTimer * 1000ul;  // convert seconds to milliseconds
+
+   // if auto purge, build up for control loop
+   auto_station = 1;  // set first auto purge station
+   state_timer=MS_TIMER;
+   if (auto_purge)
+   {  //
+      first_purge_state=PURGE_SET_DIVERTER;
+      // operation depends on turnaround config
+       if (param.turnaround_config==TRUE)
+       {
+           auto_blower=blwrPRS;  // always use pressure
+           align_turnaround=1;  // allign main
+           system_station=0;    // no remote station
+           system_stationb=0;
+           system_direction=DIR_SEND;
+       }
+       else
+       {
+           auto_blower=blwrVAC;  // always use vacuum
+           align_turnaround=0;   // no turnaround
+           system_stationb=firstBit(STATION_SET);
+           system_station=bit2station(system_stationb);
+           system_direction=DIR_RETURN;
+       }
+   }
+   else
+   {
+       // set entry state based on if turnaround is used
+       if (param.turnaround_config==TRUE) first_purge_state=PURGE_GET_TURNAROUND;
+       else first_purge_state=PURGE_GET_STATION;
+       system_direction = DIR_SEND;       // undefined
+       align_turnaround = 2;              // undefined (align remote)
+   }
+   purge_state = first_purge_state;
+   new_state = purge_state;
+   blower_purge_state = IDLE_STATE;   // remote blower idle
+   first_time_here = TRUE;            // use to show state message once per state change
+   station_msg = 1;                   // anything
+
+   inUse(FLASH, STATION_SET);
+
+   // display initial messages
+   if (auto_purge) message_add(TRANSLCD, MSG_FUNCTION, MSG_AUTO_PURGE, ONESHOTA);
+   else            message_add(TRANSLCD, MSG_FUNCTION, MSG_PURGE, ONESHOTA);
+   message_add(SYSTEMLCD, MSG_BLANK, MSG_BLANK, ONESHOT);
+
+   while ((purge_state != PURGE_EXIT) && !secTimeout(menu_timeout) )
+   {
+      hitwd();                // hit the watchdog timer
+      showactivity();
+      check_diverter();
+      processBlower();
+
+      // Exit anytime FUNC is triggered
+      // except in PURGE_RUN then go back to first_purge_state (through PURGE_RUN_DONE)
+      if (functionButton(FUNC_BUTT, FUNC_TRIG))
+      {   //if (turnaround_config==TRUE && purge_state==PURGE_GET_DIRECTION)
+          if (purge_state==PURGE_RUN)
+               new_state=PURGE_RUN_DONE;
+          else new_state=PURGE_EXIT;
+      }
+      // Exit anytime anything is pressed in auto purge
+      if (auto_purge)  // check for cancel of auto purge
+      {
+         if (  functionButton(FUNC_F1, FUNC_TRIG)
+            || functionButton(FUNC_F2, FUNC_TRIG)
+            || di_requestToSend )
+         {  new_state=PURGE_EXIT; }
+      }
+
+      // enter local loop to process purge
+      switch (purge_state) {
+
+      case PURGE_GET_TURNAROUND:            // get turnaround allignment
+         if (first_time_here==TRUE)
+         {
+            strcpy(mymessage, "F1 = TO         ");
+            for (k=0; k<strlen(param.station_name[0].name); k++)
+            { mymessage[k+8]=param.station_name[0].name[k]; }
+            lcd_print(SYSTEMLCD, 0, mymessage);
+            lcd_print(SYSTEMLCD, 1, "F2 = TO REMOTE  ");
+         }
+
+         if (functionButton(FUNC_F1, FUNC_TRIG))
+         {   new_state=PURGE_SET_DIVERTER;
+             align_turnaround=1;  // allign main
+             system_station=0;    // no remote station
+             system_stationb=0;
+         }
+
+         if (functionButton(FUNC_F2, FUNC_TRIG))
+         {   new_state=PURGE_GET_STATION;
+             align_turnaround=2;  // allign remote
+         }
+         break;
+
+      case PURGE_GET_STATION:            // get station selection
+
+         if (first_time_here==TRUE)
+         {
+            lcd_print(SYSTEMLCD, 0, sys_message[MSG_SEL_STATION].msg);
+            lcd_print(SYSTEMLCD, 1, "    TO PURGE    ");
+         }
+
+         if (di_requestToSend)
+         {  system_station=firstBit(di_requestToSend);
+            system_stationb=station2bit(system_station);
+            new_state=PURGE_SET_DIVERTER;
+         }
+
+         break;
+
+      case PURGE_SET_DIVERTER:  // set diverter and continue
+
+         if (first_time_here==TRUE)
+         {
+            //message_add(TRANSLCD, MSG_FUNCTION, MSG_PURGE, ONESHOTA);
+            //message_add(SYSTEMLCD, MSG_SETTING, MSG_TO+system_station, ONESHOT);
+            lcd_print(SYSTEMLCD, 0, sys_message[MSG_SETTING].msg);
+            lcd_print(SYSTEMLCD, 1, sys_message[MSG_TO+system_station].msg);
+            state_timer=MS_TIMER;
+         }
+
+         // Stay in this state until diverter command received
+         set_diverter(system_station);
+         command.lplc=ALL_LPLCS;
+         command.command=SET_DIVERTER;
+         command.station=system_station;
+         command.data[0]=align_turnaround;
+         if (send_command(command)) new_state=PURGE_WAIT_DIVERTER;
+         break;
+
+      case PURGE_WAIT_DIVERTER:
+
+         // no additional messages to show here
+         if (MS_TIMER-state_timer >= DIVERTER_TIMEOUT)
+         {  // timeout
+             lcd_print(SYSTEMLCD, 1, sys_message[MSG_TIMEOUT].msg);
+             new_state=PURGE_EXIT;
+         }
+
+         // Stay in this state until diverter in position
+         msDelay(10);
+         if (divertersReady(system_station))
+         {
+             station_msg = MSG_TO + system_station;
+             if (auto_purge) new_state=PURGE_RUN_AUTO;
+             else new_state=PURGE_RUN;
+         }
+         break;
+
+      case PURGE_RUN:
+
+         if (first_time_here==TRUE)
+         {
+             //message_add(TRANSLCD, MSG_FUNCTION, MSG_PURGE, ONESHOTA);
+             //message_add(SYSTEMLCD, station_msg, MSG_BLANK, ONESHOT);
+            lcd_print(SYSTEMLCD, 0, " F1=PRS  F2=VAC ");
+            lcd_print(SYSTEMLCD, 1, sys_message[MSG_BLANK].msg);
+         }
+         // Pressure
+         if (functionButton(FUNC_F1, FUNC_CURR))
+         {  if (blower_purge_state != WAIT_FOR_REM_ARRIVE)
+            {
+                blower_purge_state = WAIT_FOR_REM_ARRIVE;  // always pressure
+                blower(blwrPRS);
+                lcd_print(SYSTEMLCD, 1, "    PRESSURE    ");
+                system_direction=DIR_SEND;
+            }
+            menu_timeout = SEC_TIMER + 60;  // Don't timeout while purging
+         }
+         // Vacuum
+         else if (functionButton(FUNC_F2, FUNC_CURR))
+         {  if (blower_purge_state != WAIT_FOR_REM_DEPART)
+            {
+                blower_purge_state = WAIT_FOR_REM_DEPART;  // always vacuum
+                blower(blwrVAC);
+                lcd_print(SYSTEMLCD, 1, "     VACUUM     ");
+                system_direction=DIR_RETURN;
+            }
+            menu_timeout = SEC_TIMER + 60;  // Don't timeout while purging
+         }
+         // Idle
+         else
+         {  if (blower_purge_state != IDLE_STATE)
+            {
+                blower_purge_state=IDLE_STATE;
+                blower(blwrIDLE);
+                lcd_print(SYSTEMLCD, 1, sys_message[MSG_BLANK].msg);
+            }
+         }
+
+          // show message if arrival at turnaround
+         if ((remote_data_p[REMOTE_ARRIVE] & turnaroundStation)
+            && (system_direction==DIR_RETURN))
+         {
+            lcd_print(SYSTEMLCD, 1, "CARRIER @ BLOWER");
+         }
+
+         break;
+
+      case PURGE_RUN_AUTO:
+         // wait for auto purge duration then go to the next station
+         if (first_time_here==TRUE)
+         {
+            blower(auto_blower);
+            if (auto_blower == blwrPRS) blower_purge_state = WAIT_FOR_REM_ARRIVE;
+            else blower_purge_state = WAIT_FOR_REM_DEPART;
+            lcd_print(SYSTEMLCD, 0, "    PURGING     ");
+            lcd_print(SYSTEMLCD, 1, sys_message[station_msg].msg);
+         }
+
+         menu_timeout = SEC_TIMER + 60;  // Don't timeout while purging
+
+         if (MS_TIMER-state_timer > ms_autoPurgeTimer)
+         {   // turn off blower
+             blower(blwrIDLE);   // Always turn off the blower when leaving ... just in case.
+             blower_purge_state=IDLE_STATE;
+             align_turnaround=2;  // allign remote
+
+             // go to the next station
+            system_station++;
+            // make sure its an active station
+            while ( ((station2bit(system_station) & STATION_SET)==0)
+                   && (system_station < 8) ) system_station++;
+
+            // set the next state
+            if (system_station == 8) new_state=PURGE_EXIT;
+            else
+            {  new_state = PURGE_SET_DIVERTER;
+               system_stationb = station2bit(system_station);
+            }
+
+         }
+         break;
+
+      case PURGE_RUN_DONE:  // used to force one time through loop for remote command of blower
+         blower_purge_state=IDLE_STATE;
+         blower(blwrIDLE);
+         new_state=first_purge_state;
+         break;
+
+      case PURGE_EXIT:
+         // leaving purge here
+         blower(blwrIDLE);   // Always turn off the blower when leaving ... just in case.
+         blower_purge_state=IDLE_STATE;
+         break;
+
+      default:
+         new_state=PURGE_EXIT;
+         break;
+      } // end switch
+
+      // check for purge state change
+      if (purge_state != new_state)
+      {
+         first_time_here=TRUE;    // wasn't here yet
+         purge_state=new_state;   // this is where to be
+         state_timer=MS_TIMER;
+      }
+      else first_time_here=FALSE; // were already here
+
+	  // Check remote inputs only if processing PURGE_WAIT_DIVERTER or PURGE_RUN
+      // or PURGE_RUN_DONE or PURGE_EXIT
+	  if ( (purge_state==PURGE_WAIT_DIVERTER)
+        || (purge_state==PURGE_RUN)
+        || (purge_state==PURGE_RUN_AUTO)
+        || (purge_state==PURGE_RUN_DONE)
+        || (purge_state==PURGE_EXIT) )
+	  {
+        // Add check for remote inputs in V2.34 for Up-Receive control
+        // and now for turnaround too
+        command.lplc=ALL_LPLCS;
+        command.command=RETURN_INPUTS;
+        command.station=0;
+        command.data[0]=0;
+        command.data[1]=blower_purge_state;    // send blower state
+        command.data[2]=system_direction;      // send diverter direction
+
+		 msDelay(10);
+		 if (send_n_get(command, &response))
+		 {
+			if (response.command==INPUTS_ARE)
+			{
+			  // store remote response in local var
+			  for (k=0; k<4; k++) remote_data_p[k]=response.data[k];
+			  // force unused doors closed (on) and other unused inputs off
+			  remote_data_p[REMOTE_DOOR] |= ~STATION_SET;
+			  remote_data_p[REMOTE_CIC] &= STATION_SET;
+			  remote_data_p[REMOTE_RTS] &= STATION_SET;
+         } // end if
+       } // end if
+     } // end if
+   } // end while
+   inUse(OFF, STATION_SET);
+
+}
+
+int readParameterSettings(void)
+{  // Read the parameter block param
+   int rtn_code;
+   rtn_code = readUserBlock(&param, 0, sizeof(param));
+   if (rtn_code || (param.sysid != 63))
+   {  // fault or parameters not initialized
+      // set default parameters
+      param.sysid=63;
+   	param.names_init=0;
+		param.stacking_ok[0]=FALSE;
+		param.stacking_ok[1]=FALSE;
+   	param.remote_stat_alert=FALSE;
+		param.diverter_config=false;    // local diverter configuration
+   	param.activeStations=1;         // active station set
+		param.autoPurgeTimer=10;        // auto purge timer in seconds
+   	param.deliveryTimeout=60;       // delivery timeout in seconds
+   	param.turnaround_config=FALSE;
+		param.pw_enabled=FALSE;
+
+   }
+   STATION_SET = param.activeStations;
+   return rtn_code;
+}
+int writeParameterSettings(void)
+{  // Write the parameter block param
+   int rtn_code;
+   rtn_code = writeUserBlock(0, &param, sizeof(param));
+   return rtn_code;
+}
+int sendEthernetCommand(char sample)
+{
+// static long sequence;
+   char        counter;
+   auto char   buf[128];
+   auto int    length, retval;
+   unsigned long timer_val;
+   char * cptr;  // pointer to reference into timer value
+
+   // communication buffer content
+   // Command, Source, Destination, Sample, Timer
+
+// #GLOBAL_INIT
+// {
+//    sequence = 0;
+// }
+
+   /* fill the packet with sample data */
+   // sprintf(buf, "SEQ=%ld",sequence);
+   // determine destination counter
+   //if (param.counter2active == FALSE) counter = 1;
+   //else if (param.counter1active == FALSE) counter = 2;
+   //else counter = ((sample-1) % 2) + 1;
+   counter = 1;
+   buf[0] = 42; // sample decay time remaining
+   buf[1] = 0;  // always coming from the master
+   buf[2] = 0; //counter;
+   buf[3] = 0; //sample;
+//   timer_val = timerRemainingTime_MSEC(sample);  // send in MSec
+//   cptr = (char *)&timer_val;
+   buf[4] = 0; // *cptr++;
+   buf[5] = 0; // *cptr++;
+   buf[6] = 0; // *cptr++;
+   buf[7] = 0; // *cptr++;
+   buf[8] = 0;
+   length = 8; // length = strlen(buf) + 1;
+
+   /* send the packet */
+   retval = udp_send(&sock, buf, length);
+   if (retval < 0) {
+      printf("Error sending datagram!  Closing and reopening socket...\n");
+      sock_close(&sock);
+      if(!udp_open(&sock, LOCAL_PORT, resolve(REMOTE_IP), REMOTE_PORT, NULL)) {
+         printf("udp_open failed!\n");
+      }
+   }
+
+}
+void maintenance(void)
+{  // handle all regularly scheduled calls
+
+   hitwd();                // hit the watchdog timer
+   showactivity();
+   rn_keyProcess(DevRN1600, 0);  // process keypad device
+
+   // process command communications
+   tcp_tick(NULL);
+   //receive_command();
+
+   // process flashing inUse lights
+   if ((MS_TIMER %1000) < 300) digBankOut(0, ~(outputvalue[devInUseFlash] | outputvalue[devInUseSolid]));
+   else digBankOut(0, ~outputvalue[devInUseSolid]);
+}
+void exercise_outputs()
+{
+   /* Exercise all lighted outputs */
+   alarm(OFF);
+   do_alert(ON);
+   inUse(FLASH, ALL_STATIONS);
+   hitwd();          // "hit" the watchdog timer
+   msDelay(1000);
+   hitwd();          // "hit" the watchdog timer
+   msDelay(1000);
+   hitwd();
+   inUse(ON, ALL_STATIONS); maintenance(); msDelay(200);
+   inUse(OFF, ALL_STATIONS); do_alert(OFF); maintenance(); msDelay(200);
+   inUse(ON, ALL_STATIONS);  do_alert(ON); maintenance();  msDelay(200);
+   inUse(OFF, ALL_STATIONS); do_alert(OFF); maintenance();
+   hitwd();          // "hit" the watchdog timer
+
+}
+
+/******************************************************************/
+char station2bit(char station)
+{  /* Converts the station number assignment to an equivalent
+      bit value.  ie. station 3 -> 0100 (=4) .. same as 2^(sta-1)
+      NOTE: Returns 0 if station is not 1..8  */
+
+   if (station) return 1 << (station-1);
+   else return 0;
+}
+/******************************************************************/
+char bit2station(char station_b)
+{  /* Converts a bit assignment to the bit number value
+      ie. 0100 -> station 3.
+NOTE: Returns 0 if more than 1 station bit is active */
+
+   char stanum, i;
+   stanum = 0;
+
+   for (i=0; i<8; i++)
+   {
+      if (1<<i == station_b) stanum=i+1;
+   }
+   return stanum;
+}
+/******************************************************************/
+char firstBit(char bitdata)
+{  // Return # of first bit that is on (1-8)
+   char i;
+   i=0;
+   while (i<8 && ((1<<i & bitdata)==0)) i++;
+   if (i<8) return i+1;
+   else     return 0;
+}
+
+/******************************************************************/
+// PASSWORD FUNCTIONS
+/******************************************************************/
+// uses
+// param.pw_enabled;         // flag indicating if password is setup/enabled
+// param.syspassword[5];     // buffer for system password
+
+char verifyPassword()
+{   // gets the password from the user and checks it against
+    // the system password.
+    // Returns 1 if the entered password matches or 0 if it doesn't.
+
+    char pwbuffer[5];  // length is 4 plus string terminator.
+    char rtnval;       // function return value: 1=yes/ok; 0=no/not ok;
+
+    // make sure password is enabled
+    if (param.pw_enabled==ON)
+    {
+       message_add(TRANSLCD, MSG_FUNCTION, MSG_ENTERPW, ONESHOTA);
+       message_add(SYSTEMLCD, MSG_BLANK, MSG_BLANK, ONESHOT);
+
+       // read user input
+       getPassword(pwbuffer);
+
+       // compare to system password
+       if (strncmp(pwbuffer, param.syspassword, 4)==0) rtnval=1;
+       else rtnval=0;
+
+    } else rtnval=1;  // no password needed, return good
+
+    return rtnval;
+}
+
+char setPassword()
+{   // prompts user to enter new password
+    // returns TRUE if password was changed
+    char pwbuf1[5], pwbuf2[5];
+    char rtnval;       // function return value: TRUE=yes/set; FALSE=no/not set;
+
+
+    message_add(TRANSLCD, MSG_FUNCTION, MSG_ENTERPW, ONESHOTA);
+    message_add(SYSTEMLCD, MSG_BLANK, MSG_BLANK, ONESHOT);
+
+    // read user input twice
+    if (getPassword(pwbuf1) == 0)
+    {
+       message_add(TRANSLCD, MSG_FUNCTION, MSG_ENTERPW+1, ONESHOTA);
+       message_add(SYSTEMLCD, MSG_BLANK, MSG_BLANK, ONESHOT);
+       getPassword(pwbuf2);
+    } else { pwbuf1[0] = ~pwbuf2[0]; } // force not equal
+
+    // make sure passwords match
+    if (strncmp(pwbuf1, pwbuf2, 4)==0)
+    {
+       // save new password
+       strncpy(param.syspassword, pwbuf1, 4);
+       lcd_print(SYSTEMLCD, 1, "PASSWORD CHANGED");
+       print_event("PASSWORD CHANGED");
+       param.pw_enabled=1;  // enable password
+       // savePassword();
+       rtnval = TRUE;
+
+    } else
+    {
+       lcd_print(SYSTEMLCD, 1, "  NOT VERIFIED! ");
+       print_event("PASSWORD NOT CHANGED!");
+       rtnval = FALSE;
+    }
+	return rtnval;
+}
+void clearPassword()
+{
+   param.pw_enabled=0;     // disable
+   lcd_print(SYSTEMLCD, 1, "PASSWORD CLEARED");
+   print_event("PASSWORD CLEARED");
+   // savePassword();
+}
+
+char getPassword(char *pwbuff)
+{   // reads the password from the station selection push buttons or keypad
+    // and uses lcd display for output prompting.
+    // return code is normal 0; or timeout 1;
+    char doingit, digit, key;
+    char pwdisplay[10];
+    unsigned long tval;
+
+
+    // pwbuff will be loaded with the users input password
+    // current length of password = 4 digit; pwbuff = 4+terminator = 5
+
+    tval = MS_TIMER;
+    doingit=1;
+    digit=0;
+    pwbuff[0]=0;
+    lcd_show_cursor(SYSTEMLCD, 0, digit);
+    while (doingit)
+    {
+        // show activity
+        showactivity();
+        hitwd();
+
+        key = getKey();  // get station input button
+        // if (key) // this IF for station input buttons
+        // Next IF for keypad input buttons
+		  if ((key >= '0') & (key <= '9'))   // ignore other keypad keys
+        {  // convert from KEYPAD to number
+           if (key >= '0') key-=48;        // use IF in case I forget to switch from keypad to station button
+           // add character to password
+           *(pwbuff+digit) = key;
+           pwdisplay[digit]='*'; pwdisplay[digit+1]=0;  // add null term
+           digit++;
+
+           // display '*' on lcd
+           lcd_print(SYSTEMLCD, 0, pwdisplay);
+           lcd_show_cursor(SYSTEMLCD, 0, digit);
+        }
+        if (digit==4) doingit=0;
+
+        // cancel on timeout
+        if (MS_TIMER - tval > PASSWORD_TIMEOUT) doingit=0;
+    }
+
+    if (MS_TIMER - tval > PASSWORD_TIMEOUT) return 1; else return 0;
+
+}
+// This function is replaced by readParameterSettings
+// void loadPassword()
+// This function is replaced by writeParameterSettings
+// void savePassword()
+
+/******************************************************************/
+/* Communications drivers */
+#define CMD_LENGTH  10
+#define RCV_TIMEOUT 50
+#define ACK_TIMEOUT 20
+#define BUF_COUNT 1
+#define BUF_SIZE 10
+#define BAUD_RATE 19200
+int badcmd;
+#define CSTATS 10
+unsigned long commstat[CSTATS];
+char commerror, wascommerror;
+const char *commlbl[CSTATS] = {
+"MESSAGES SENT   ","MESSAGES RECVD  ","MSGS NOT RECVD  ","MSGS ANSWERED   ",
+"# BAD CHECKSUM  ","# INCOMPLETE INP","# NO STX/ETX    ","# UNKNOWN ACK   ",
+"# NAK           ","# NIL           " };
+
+// message buffer for general work use
+struct iomessage workmsg;
+
+void disable485whenDone(void)
+{
+   while (serDwrUsed());          // wait for all bytes to be transmitted
+   while (RdPortI(SDSR) & 0x0C);  // wait for last byte to complete
+   serDrdFlush();                 // flush the read buffer
+   ser485Rx();                    // disable transmitter
+}
+char init_communication()
+{
+   char stat, i;
+
+   // Initialize packet driver
+   // Coyote uses port D for RS485
+   // use default buffer sizes (31 bytes, tx & rx)
+   serDopen(BAUD_RATE);
+   ser485Rx();
+   serDrdFlush();     // clear receive buffer
+   serDwrFlush();     // clear transmit buffer
+
+   badcmd=0;
+
+   workmsg.lplc=ALL_LPLCS;
+   workmsg.command=RESET;
+   workmsg.station=0;
+   stat = send_command( workmsg );   // return code to determine comm status
+
+   // clear comm status counters
+   for (i=0; i<CSTATS; i++) commstat[i]=0;
+   wascommerror=0;   // reset com error state change flag
+
+   return stat;
+}
+unsigned long t1, t2, t3, t4;    // debug
+char send_n_get(struct iomessage message, struct iomessage *response)
+{
+   // Transmits message to 1 or all lplcs and combines responses for return
+   // Verify success by response.lplc -- equals those that answered
+   // Uses global data structure extendedData[]
+   char i, j, firstLplc, lastLplc;
+   char good,retry,anygood;
+
+   response->lplc=0;
+   response->command=0; // message.command;
+   response->station=0;
+   response->data[0]=0;
+   response->data[1]=0;
+   response->data[2]=0;
+   response->data[3]=0;
+
+   // process send/return for each controller necessary
+   if (message.lplc == ALL_LPLCS)
+   {
+      firstLplc=FIRST_LPLC;
+      lastLplc=LAST_LPLC;
+   } else
+   {
+      firstLplc=message.lplc;
+      lastLplc=message.lplc;
+   }
+   commerror=0;   // reset only once each pass through this routine
+                  // so that 1 bad plc & 1 good plc still flags error
+   for (i=firstLplc; i<=lastLplc; i++)
+   {  if ( (1 << (i-1)) & ALL_LPLCS )  // if i is a remote lplc
+      {
+         // set little plc id
+         message.lplc=i;
+         if (i != firstLplc) msDelay(10);   // wait for data lines to clear
+         retry=3;
+         good=FALSE;
+         while (!good && retry)
+         {
+            if (send_command(message))
+            {  // sent command ok, now get response
+               workmsg.command=0;   // clear for input of response
+               get_response(&workmsg);
+               if (workmsg.command==message.command)
+               {  // OR all the input responses together
+                  for (j=0; j<4; j++) response->data[j] |= workmsg.data[j];
+                  response->lplc |= workmsg.lplc;
+                  response->station |= workmsg.station;
+                  response->command = workmsg.command;
+                  good=TRUE;
+                  anygood=TRUE;
+                  // if extended data command then store data in alternate location
+                  if (workmsg.command==RETURN_EXTENDED) for (j=0; j<4; j++) extendedData[i][j]=workmsg.data[j];
+               } else retry--;
+            } else retry--;
+         }
+         if (!good) commerror=1;   // set flag on failed communications
+      }
+   }
+
+   return anygood;
+}
+
+char get_response(struct iomessage *message)
+{
+   char i, status;
+   char rcvbuf[CMD_LENGTH];
+   int rcvcount;
+   char cksum;
+   unsigned long tstart;
+
+   message->command=0;  /* assume no response for now */
+
+   /* enable the receiver to get cmdlen characters */
+   ser485Rx();  // should have been done already
+   // rcvcount = CMD_LENGTH;
+	t3=MS_TIMER;      // debug
+   //ser_rec_z1(rcvbuf, &rcvcount);
+
+   // align frame to <STX>
+   while ((serDrdUsed() > 0) && (serDpeek() != STX)) printf("gr tossing %d\n",serDgetc());
+
+   rcvcount = 0;
+   tstart = MS_TIMER;
+   while (rcvcount==0 && (MS_TIMER - tstart < RCV_TIMEOUT))
+      rcvcount = serDread(rcvbuf, CMD_LENGTH, RCV_TIMEOUT);
+
+	t4=MS_TIMER;      // debug
+   if (rcvcount != CMD_LENGTH)
+   {  /* not all characters received */
+      // ser_kill_z1();       /* disable and return failure */
+      ++commstat[5];       // increment status counter
+	   #ifdef PRINT_ON
+	      printf("\n INCOMPLETE INPUT: (%d) ",rcvcount);
+	      for (i=0; i<rcvcount; i++) printf(" %d", rcvbuf[i]);
+	   #endif
+      status=FALSE;
+   } else
+   {  /* got the right number of characters */
+      if ( (rcvbuf[0] != STX)
+      || (rcvbuf[CMD_LENGTH-2] != ETX))
+      {
+		    ++commstat[6];       // increment status counter
+	      #ifdef PRINT_ON
+	         printf("\n BAD INPUT: No STX %d and/or ETX %d", rcvbuf[0],rcvbuf[CMD_LENGTH-2]);
+	      #endif
+		   status=FALSE;
+      }
+      else
+      {  /* check the checksum */
+	   	cksum=0;
+	      for (i=0; i<CMD_LENGTH-1; i++) cksum += rcvbuf[i];
+
+    		if (cksum != rcvbuf[CMD_LENGTH-1])
+			{  /* bad checksum */
+      		++commstat[4];       // increment status counter
+	         #ifdef PRINT_ON
+	           printf("\n CHECKSUM ERROR: Calculated %d not equal to xmitted %d",cksum, rcvbuf[CMD_LENGTH-1]);
+	         #endif
+	         status=FALSE;
+	      }
+	      else
+	      {  /* command is good */
+	         ++commstat[3];       // increment status counter - # returned
+	         message->lplc = rcvbuf[1];
+	         message->command = rcvbuf[2];
+	         message->station = rcvbuf[3];
+	         message->data[0] = rcvbuf[4];
+	         message->data[1] = rcvbuf[5];
+	         message->data[2] = rcvbuf[6];
+	         message->data[3] = rcvbuf[7];
+	         status=TRUE;
+	      }
+      }
+   }
+//printf(" :: %ld  %ld  %ld \n", t2-t1, t3-t2, t4-t3);    // debug
+   return status;
+}
+/******************************************************************/
+char txcounter;
+char send_command(struct iomessage message)
+{  /* Transmits a message/command to the remote system(s).
+      Command string defined as:
+      <STX> <lplc> <Command> <Station> <Data0..3> <ETX> <CHKSUM> */
+
+   // Set <lplc> = ALL_LPLCS to transmit command to all little plc's
+
+   char i,good,retry;
+   char cmdstr[CMD_LENGTH];
+   char cmdlen;
+   char rcvbuf[CMD_LENGTH];
+   unsigned long timeout, cmdsent;
+   char mybuf[100];
+   char tmpbuf[10];
+   int bufchrs;
+   mybuf[0]=0;
+
+   good=0;                        /* return value -- assume nogood*/
+   retry=3;
+
+   ++commstat[0];       // increment status counter -- total sent
+
+   hitwd();             // hit watchdog incase comm loop
+
+   while (!good && retry)
+   {
+      /* assemble the full command string */
+      cmdlen = CMD_LENGTH;
+      cmdstr[0] = STX;
+      cmdstr[1] = message.lplc;                       // one or all little plc's
+      cmdstr[2] = message.command;
+      cmdstr[3] = message.station;
+      cmdstr[4] = message.data[0];
+      cmdstr[5] = message.data[1];
+      cmdstr[6] = message.data[2];
+      cmdstr[7] = message.data[3];
+//cmdstr[7]=txcounter++;
+      cmdstr[8] = ETX;
+      cmdstr[9] = 0;
+      for (i=0; i<cmdlen-1; i++) cmdstr[cmdlen-1] += cmdstr[i]; /* checksum */
+
+      // enable transmitter and send
+      ser485Tx();
+      cmdlen = serDwrite(cmdstr, CMD_LENGTH);
+      disable485whenDone();
+
+      // get ack if sending to one plc
+      if ( (message.lplc & 0x80) == 0 )   // high bit not set, ergo only 1 lplc
+      {  // try to throw out first character in case of immediate junk
+	      // cmdlen = serDread(rcvbuf, 1, 0);
+         /* should get an ACK or NAK within a short timeout */
+         rcvbuf[0]=0;
+         cmdlen=0;                       // one character answer
+         timeout = MS_TIMER;
+	      //serDrdFlush(); // try to flush the read buffer again
+         while ((rcvbuf[0] != ACK) && (rcvbuf[0] != NAK) && (MS_TIMER - timeout < ACK_TIMEOUT))
+         	cmdlen = serDread(rcvbuf, 1, 0);
+
+         // pre check for ACK, NAK and if not try getting another character
+         //if ((cmdlen) && (rcvbuf[0] != ACK) && (rcvbuf[0] != NAK))
+         //   { cmdlen = 0;
+		   //      while (cmdlen==0 && (MS_TIMER - timeout < ACK_TIMEOUT))
+		   //         cmdlen = serDread(rcvbuf, 1, 0);
+         //   }
+
+//   printf("it took %ld ms to get %d response %d\n", MS_TIMER-timeout, cmdlen, rcvbuf[0]);
+//   if (rcvbuf[0] != ACK) {msDelay(1); printf("peeking at %d\n", serDpeek());}
+
+         if (rcvbuf[0] == ACK)         // received and acknowleged
+         {  good = 1;                  // TRUE
+         }
+         else if (rcvbuf[0] == NAK)    // Not received properly
+         {
+       		++commstat[8];             // increment status counter
+				//if (PRINT_ON) printf("NAK  ");
+	         #ifdef PRINT_ON
+	           strcat(mybuf,"NAK ");
+	         #endif
+         }
+         else if (rcvbuf[0])           // Unknown response
+         {
+       		++commstat[7];             // increment status counter
+				//if (PRINT_ON) printf("DK  ");
+				#ifdef PRINT_ON
+               strcat(mybuf,"DK ");
+               itoa((int)rcvbuf[0], tmpbuf);
+               strcat(mybuf,tmpbuf);
+            #endif
+         }
+         else                          // No response
+         {
+       		/* Re-initialize serial port 1 */
+       		//ser_init_z1(4, 19200/1200);
+            //serDclose();
+            //serDopen(BAUD_RATE);
+            ++commstat[9];                                  // increment status
+				//if (PRINT_ON) printf("NIL  ");
+				#ifdef PRINT_ON
+            	strcat(mybuf,"NIL ");
+            #endif
+         }
+         --retry;
+      } else good = 1;
+   }
+   // Update communication statistics and flags
+   if (good) { ++commstat[1]; }   // don't reset commerror flag here
+   else { ++commstat[2]; }
+
+	#ifdef PRINT_ON
+      //if (strlen(mybuf) > 0) printf("%ld %s\n",SEC_TIMER, mybuf);
+   #endif
+
+   return good;
+}
+
+void show_comm_status()
+{
+   static unsigned long updateclock;
+
+   #GLOBAL_INIT
+   {  updateclock = 0; }
+
+   // now=SEC_TIMER;
+
+   if (SEC_TIMER > updateclock)
+   {
+      updateclock=SEC_TIMER+2;
+
+      // put up or remove communications status message
+      if (commerror) message_add(SYSTEMLCD, MSG_NOCOMM, MSG_NOCOMM+1, NEXT);
+      else message_del(SYSTEMLCD, MSG_NOCOMM, MSG_NOCOMM+1);
+   }
+   // else if (updateclock-2 > SEC_TIMER) updateclock=SEC_TIMER;  // means updateclock is grossly out of whack
+
+   // log to printer on failure and restore
+   if (commerror != wascommerror)   // limit recurring code in normal loop
+   {
+      if (commerror & !wascommerror)
+      {   // error occured now
+          print_event("LOST REMOTE COMMUNICATIONS");
+      } else if (wascommerror & !commerror)
+      {   // error cleared now
+          print_event("REMOTE COMMUNICATIONS RESTORED");
+      }
+      wascommerror=commerror;
+   }
+}
+
+void show_comm_test()
+{  // Show communication statistics on the LCD display
+   char i, msgbuf[16];
+
+   // loop through each statistic
+   for (i=0; i<CSTATS; i++)
+   {
+      if (commstat[i])        // only show if non-zero
+      {
+        lputs(0, commlbl[i]);		// write the descriptive label
+        ltoa(commstat[i],msgbuf);
+        lputs(1,"                ");
+        lputs(1, msgbuf);			// write the statistic value
+        msDelay(1500);
+      }
+   }
+}
+/******************************************************************/
+void checkRemoteConfiguration(void)
+{  // determine which remotes are connected to the bus
+
+   struct iomessage testcmd, testrsp;
+   char i, workset, mymsg[20], mybuf[10];
+   int j;
+
+   FIRST_LPLC=0;   // number
+   LAST_LPLC=0;    // number
+   workset=0;
+   ALL_LPLCS=((1 << MAX_LPLCS) - 1 ) | 0x80; // bits ... including high bit
+
+   lcd_print(SYSTEMLCD, 0, " CHECKING REMOTE");
+   lcd_print(SYSTEMLCD, 1, " CONFIGURATION  ");
+   // hold for a few seconds
+   msDelay(1000);
+
+   strcpy(mymsg, "  ");
+   STATION_SET = 0;                  // startoff with none
+   for (j=1; j<=MAX_LPLCS; j++)
+   {
+      hitwd();
+      testcmd.station=0;
+      testcmd.lplc=j;
+      testcmd.command=RETURN_INPUTS;
+      msDelay(100);       // seems to improve communications
+      i = send_n_get( testcmd, &testrsp );      // are you alive
+      if (testrsp.lplc==testcmd.lplc)
+      {  // this one is alive
+         STATION_SET |= testrsp.station;        // who do you own
+         if (FIRST_LPLC==0) FIRST_LPLC=j;
+         LAST_LPLC=j;
+         workset |= (1 << (j-1));                // include this bit
+         itoa(j, mybuf);
+         strcat(mymsg, " #");
+         strcat(mymsg, mybuf);
+      }
+   }
+   STATION_SET &= activeStations;  // allow only those programmed in diag menu
+   ALL_LPLCS = workset | 0x80;     // also set high bit, meaning ALL
+
+   if (strlen(mymsg) <= 3) strcpy(mymsg, "----- NONE -----");
+
+   // pad the message buffer
+   for (j=strlen(mymsg); j<16; j++) strcat(mymsg, " ");
+
+   // show the results of the query
+   lcd_print(SYSTEMLCD, 0, "RESPONSE OK FROM");
+   lcd_print(SYSTEMLCD, 1, mymsg);
+
+   // reset communications statistics
+   init_communication();
+
+   // hold for a few seconds
+   msDelay(2000);
+}
+
+nodebug void reset_statistics()
+{
+   // reset system statistics
+   statistics.trans_in=0;
+   statistics.trans_out=0;
+   statistics.deliv_alarm=0;
+   statistics.divert_alarm=0;
+   statistics.other_alarm=0;
+}
+
+void time2string(unsigned long time, char *buf, int format)
+{  // Converts the time value into a string as specified by format
+   // time    time value to be converted
+   // buf     destination string ... make sure you allocate enough room
+   // format  how the time should be converted
+   //         1 = HH:MM:SS     2 = HH:MM
+   //         3 = MM/DD/YY     4 = MM/DD/YY HH:MM:SS
+
+   struct tm mytime;
+   char * myptr;
+
+   // convert long time to structure
+   mktm( &mytime, time);
+   myptr=buf;
+
+   // convert date
+   if (format==3 || format==4)
+   {
+      // fill in the date values
+      *myptr++ = 48 + (mytime.tm_mon / 10);
+      *myptr++ = 48 + (mytime.tm_mon % 10);
+      *myptr++ = '/';
+      *myptr++ = 48 + (mytime.tm_mday / 10);
+      *myptr++ = 48 + (mytime.tm_mday % 10);
+      *myptr++ = '/';
+      *myptr++ = 48 + ((mytime.tm_year / 10) % 10);
+      *myptr++ = 48 + (mytime.tm_year % 10);
+
+   }
+
+   // convert time
+   if (format==1 || format==2 || format==4)
+   {
+      if (format==4) *myptr++ = 32;   // space seperator
+
+      // fill in the time values
+      *myptr++ = 48 + (mytime.tm_hour / 10);
+      *myptr++ = 48 + (mytime.tm_hour % 10);
+      *myptr++ = ':';
+      *myptr++ = 48 + (mytime.tm_min / 10);
+      *myptr++ = 48 + (mytime.tm_min % 10);
+
+      if (format==1 || format==4)  // format seconds
+      {  *myptr++ = ':';
+         *myptr++ = 48 + (mytime.tm_sec / 10);
+         *myptr++ = 48 + (mytime.tm_sec % 10);
+      }
+   }
+
+  *myptr = 0;    // null terminator
+
+}
+
+/******************************************************/
+// Printout functions
+/******************************************************/
+void print_event(char *event)
+{
+   char myline[80];     // line to send to the printer
+   char * instr;        // work pointer into myline
+
+   instr=myline;
+   time2string(SEC_TIMER, instr, 4);      // event time
+   strcat(myline, " ");
+   strcat(myline, event);
+///   reset_printer();  // reset/retry printer each time
+///   print_line(myline);
+
+}
+
+void print_malfunction(struct trans_log_type log)
+{
+   char myline[80];     // line to send to the printer
+   char * instr;        // work pointer into myline
+
+
+   strcpy(myline, "ALARM ");
+   instr=myline+strlen(myline);
+   time2string(log.malf_tm, instr, 4);      // malfunction time
+   strcat(myline," ");
+   instr=myline+strlen(myline);
+   if (log.malf_type==1) strcat(myline, "DIVERTER TIMEOUT");
+   if (log.malf_type==2) strcat(myline, "CARRIER EXIT TIMEOUT");
+   if (log.malf_type==3) strcat(myline, "DELIVERY OVERDUE");
+   if (log.malf_type==4) strcat(myline, "BLOWER TIMEOUT");
+   if (log.malf_type==5) strcat(myline, "COMMUNICATIONS LOST");
+   if (log.malf_type==6) strcat(myline, "CANCEL DISPATCH");
+
+///   reset_printer();  // reset/retry printer each time
+///   print_line(myline);
+
+   print_transaction( log );  // now print normal log
+
+}
+
+
+void print_transaction(struct trans_log_type log)
+{
+   char myline[80];     // line to send to the printer
+   char * instr;        // work pointer into myline
+   long transtime;      // how long transaction took
+
+   // format the message line
+   time2string(log.start_tm, myline, 4);      // start time
+   strcat(myline," ");
+   instr=myline+strlen(myline);
+   sprintf(instr, "%-12s", param.station_name[log.source_sta].name);
+   strcat(myline, "-->> ");
+   instr=myline+strlen(myline);
+   time2string(log.end_tm, instr, 1);
+   transtime=log.end_tm-log.start_tm;
+   instr=myline+strlen(myline);
+   sprintf(instr, " %-12s %4ld sec", param.station_name[log.dest_sta].name, transtime);
+
+///   reset_printer();  // reset/retry printer each time
+///   print_line(myline);
+}
+/******************************************************/
+const char prLine[] = "-----------------------------------------------------------------";
+void print_summary(struct stats_type stats, char how)
+{
+   // stats  :  system summary statistics
+   // how    :  automatic report (0) or on-demand report (1)
+
+   char myline[80];     // line to send to the printer
+   char * instr;        // work pointer into myline
+   long subtot;         // total of transactions or alarms
+/*
+   reset_printer();  // reset/retry printer each time
+   print_line(prLine);
+   print_line(station_name[system_name].name);  // print system name
+   if (how==0) {   strcpy(myline, "  Daily ");
+   } else { strcpy(myline, "  On-Demand "); }
+   strcat(myline, "Transaction Summary Printed ");
+   instr = myline + strlen(myline);
+   time2string(clock(), instr, 4);
+   print_line(myline);
+   print_line(prLine);
+   print_line(" Transactions:");
+   sprintf(myline, "    Incoming:              %ld", stats.trans_in);
+   print_line(myline);
+   sprintf(myline, "    Outgoing:              %ld", stats.trans_out);
+   print_line(myline);
+   sprintf(myline, "    Daily Total:           %ld", stats.trans_in + stats.trans_out);
+   print_line(myline);
+   sprintf(myline, "    Grand Total:           %ld", transactionCount());
+   print_line(myline);
+   print_line(" ");
+   print_line(" Alarms:");
+   sprintf(myline, "    Incomplete Delivery:   %d", stats.deliv_alarm);
+   print_line(myline);
+   sprintf(myline, "    Diverter Timeout:      %d", stats.divert_alarm);
+   print_line(myline);
+   sprintf(myline, "    Other Timeouts:        %d", stats.other_alarm);
+   print_line(myline);
+   subtot=stats.deliv_alarm+stats.divert_alarm+stats.other_alarm;
+   sprintf(myline, "    Total:                 %ld", subtot);
+   print_line(myline);
+   print_line(prLine);
+*/
+}
+
+void check_auto_report(struct stats_type stats)
+{
+
+   if (SEC_TIMER >= nextAutoPrint)
+   {
+      // time to print automatic summary report
+      print_summary(stats, 0);
+
+      // increment to next day (86400 seconds per day)
+      while (nextAutoPrint <= SEC_TIMER) { reset_auto_print(); }
+
+      // reset statistics
+      reset_statistics();
+   }
+}
+void reset_auto_print()
+{  // set auto print statistics for midnight tomorrow
+   nextAutoPrint = (((SEC_TIMER+1) / 86400) +1) * 86400;
+}
+
+
+nodebug
+void msDelay(unsigned int delay)
+{
+   auto unsigned long start_time;
+   start_time = MS_TIMER;
+   if (delay < 500) while( (MS_TIMER - start_time) <= delay );
+   else while( (MS_TIMER - start_time) <= delay ) hitwd();
+}
+nodebug char secTimeout(unsigned long ttime)
+{
+   return (ttime > SEC_TIMER) ? FALSE : TRUE;
+}

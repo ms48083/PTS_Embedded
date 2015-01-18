@@ -1,0 +1,5 @@
+cbWatch0=logInfo.Tail
+cbWatch1=logInfo.Head
+cbWatch2=sizeOfTransLog()
+cbWatch3=sizeof(trans)
+cbWatch4=transactionCount()

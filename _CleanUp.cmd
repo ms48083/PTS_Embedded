@@ -1,0 +1,9 @@
+del *.bdl /q
+del *.brk /q
+del *.hdl /q
+del *.bak /q
+del *.map /q
+del *.rom /q
+del *.dbg /q
+del *.hex /q
+del *.org /q

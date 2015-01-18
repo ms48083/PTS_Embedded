@@ -1,0 +1,34 @@
+cbWatch0=printf("%010lu\n", lo)
+cbWatch1=printf("%09lu\n", lo)
+cbWatch2=printf("%lu\n", lo)
+cbWatch3=snprintf(Result, 13, "%lu\n", lo)
+cbWatch4=snprintf(Result, 13, "%d%lu\n", hi, lo)
+cbWatch5=snprintf(Result, 13, "%d%010lu\n", hi, lo)
+cbWatch6=snprintf(Result, 13, "%d%09lu\n", hi, lo)
+cbWatch7=Res[4]
+cbWatch8=Res[3]
+cbWatch9=Res[2]
+cbWatch10=Res[1]
+cbWatch11=Result[4]
+cbWatch12=Result[3]
+cbWatch13=Result[2]
+cbWatch14=Result[1]
+cbWatch15=Result[0]
+cbWatch16=Result
+cbWatch17=(char)((lval >> 24) & 0xFF)
+cbWatch18=lval
+cbWatch19=(unsigned long) Result = lval
+cbWatch20=(unsigned long *) Result = lval
+cbWatch21=(long *) Result = lval
+cbWatch22=(long *) &Result[1] = 1
+cbWatch23=(long *) &Result[1] = lval
+cbWatch24=(long*)&Result[1] = lval
+cbWatch25=(long)&Result[1] = lval
+cbWatch26=(long *)(&Result[1])
+cbWatch27=strcpy(id, "111123123123")
+cbWatch28=strcpy(id, "154999999999")
+cbWatch29=strcpy(id, "155000000000")
+cbWatch30=strcpy(id, "155999999999")
+cbWatch31=j
+cbWatch32=j + (k*l)
+cbWatch33=k*l
