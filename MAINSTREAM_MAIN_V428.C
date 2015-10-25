@@ -217,11 +217,12 @@
    30-Dec-14   v427 Auto-resync of transaction logs with server
    18-Jan-15   v428 Instrument with messages to debug server message return problem
 				        Make sure server IP is valid otherwise reset to blank
+   14-Apr-15   v429 Increase tcpWaitTimer (server timeout) from 3000 to 5000 msec
 
 *****************************************************************/
-#define FIRMWARE_VERSION "Mainstream V4.28"
+#define FIRMWARE_VERSION "Mainstream V4.29"
 #define VERS                            4
-#define SUBVERS                         28
+#define SUBVERS                         29
 
 #define MYDEBUG nodebug
 #define STDIO_DISABLE_FLOATS
@@ -1894,9 +1895,9 @@ if (MS_TIMER - lastComTime > 10)
             }
          }
 	      else if (SEC_TIMER > pingTimer)  // check with server
-	      {  // check server then update next check time (in case clock changed)
-	         tcpServerCheck();
+	      {  // update next check time then check server
             pingTimer = SEC_TIMER + (60 * (int)param.syncInterval);
+	         tcpServerCheck();
 	      }
          else
          {  // check main request
@@ -9583,6 +9584,11 @@ int tcpServerCheck()
    int iSee;
    int iRcv;
 
+   #GLOBAL_INIT
+   {	// initialize local variables
+		usrcount=0;
+   }
+
    iSee=0;
    iRcv=0;
 
@@ -9617,7 +9623,7 @@ int tcpServerCheck()
       // wait for bytes to be ready OR TIMEOUT
       ii=-1;
       tcpWaitTimer = MS_TIMER;
-      while((ii < 0) && (!Timeout(tcpWaitTimer, 3000))) { ii=sock_bytesready(&tcpsock); tcp_tick(&tcpsock); }
+      while((ii < 0) && (!Timeout(tcpWaitTimer, 5000))) { ii=sock_bytesready(&tcpsock); tcp_tick(&tcpsock); }
       // printf("sock_bytesready = %d  %ld\n", ii, MS_TIMER - processTime);
       printf("a.Socket state %d  %ld\n", tcp_tick(&tcpsock), MS_TIMER - processTime);
 // how many bytes detected
