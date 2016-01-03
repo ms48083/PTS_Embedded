@@ -413,7 +413,7 @@ struct {
 	//unsigned long id;
    char id[UIDLen];  // same as UIDLen
    unsigned long time;
-} secureCard, stdCard;
+} secureCard, stdCard, unauthCard;
 unsigned long arrivalTime;
 
 /* Array index values for remote data, returned by INPUTS_ARE command. */
@@ -637,6 +637,8 @@ void setDiverterMap(char portMap)
 	diverter_map[4] = 0; diverter_map[5] = 0;
 	diverter_map[6] = 0; diverter_map[7] = 0;
 	diverter_map[8] = 0; // for main to main
+   initBlower();  // put this here to be similar to diverter software
+
 }
 
 void init_io()
@@ -655,8 +657,10 @@ void init_io()
    //secureCard.id=0;
    UID_Clear(secureCard.id);
    UID_Clear(stdCard.id);
+   UID_Clear(unauthCard.id);
    secureCard.time=0;
    stdCard.time=0;
+   unauthCard.time=0;
    handleSecure=FALSE;
    arrivalTime=0;
    purge_mode=0;
@@ -829,10 +833,13 @@ void processCardReads(void)
 ///        || (((cardID_hb+CARDHBOFFSET) == param.card2L3Digits)
 ///         && ((cardID_lb) >= param.card2R9Min)
 ///         && ((cardID_lb) <= param.card2R9Max)) )
-		if ((param.cardCheckEnabled == FALSE) || (UID_Search(Uid) >= 0))
-      {  printf(" Card is valid\n");
-	      gotCardRead = TRUE;
-      }
+
+		///if ((param.cardCheckEnabled == FALSE) || (UID_Search(Uid) >= 0))
+      ///{  printf(" Card is valid\n");
+	   ///   gotCardRead = TRUE;
+      ///}
+      gotCardRead = TRUE; // Always accept a card read regardless of param and search
+
 	} //else if (gotCardRead==FALSE) secureCardID = 0; // only clear if not pending xmit
 
    // check for PIN read if in a secure transaction
@@ -862,29 +869,43 @@ void processCardReads(void)
       }
       else
       {  // no active transaction, so what next
-	   	if (handleSecure)
-         {  // we need to deal with secure, did we get a pin also
-            if (gotPinRead)
-	         {  // Got a valid PIN number on a secure transaction
-	            unlockDoor();   // Unlatch door
-	            // Return card number to host (in return inputs x2)
-	            // Reset operations
-	            handleSecure=FALSE;
-	            gotPinRead=FALSE;
-	            gotCardRead=FALSE;
-               //secureCard.id = cardID_lb;
-			      memcpy(secureCard.id, Uid, sizeof(Uid));
-               secureCard.time = SEC_TIMER - arrivalTime;
+         // 3 choices
+         //   Card check not enabled
+         //   Card check enabled and card found
+         //   Card check enabled and card not found
+         // Choice 1 & 2
+         if ((param.cardCheckEnabled == FALSE) || (UID_Search(Uid) >= 0))
+         {  // Either card check not enabled or is enabled and card found
+	         if (handleSecure)
+	         {  // we need to deal with secure, did we get a pin also
+	            if (gotPinRead)
+	            {  // Got a valid PIN number on a secure transaction
+	               unlockDoor();   // Unlatch door
+	               // Return card number to host (in return inputs x2)
+	               // Reset operations
+	               handleSecure=FALSE;
+	               gotPinRead=FALSE;
+	               gotCardRead=FALSE;
+	               //secureCard.id = cardID_lb;
+	               memcpy(secureCard.id, Uid, sizeof(Uid));
+	               secureCard.time = SEC_TIMER - arrivalTime;
+	            }
 	         }
-         }
-         else
-         {  // not doing anything else so just open door
-         	unlockDoor();
-            gotCardRead=FALSE;
-            // need to send non-secure card reads as well
-            memcpy(stdCard.id, Uid, sizeof(Uid));
-				stdCard.time = SEC_TIMER;
+	         else
+	         {  // not doing anything else so just open door
+	            unlockDoor();
+	            gotCardRead=FALSE;
+	            // need to send non-secure card reads as well
+	            memcpy(stdCard.id, Uid, sizeof(Uid));
+	            stdCard.time = SEC_TIMER;
 
+	         }
+         } else
+         {  // Choice 3 card check enabled and card not found
+            // don't unlock door, but do send card data to host
+            gotCardRead=FALSE;
+            memcpy(unauthCard.id, Uid, sizeof(Uid));
+            unauthCard.time = SEC_TIMER;
          }
       }
    }
@@ -1045,6 +1066,10 @@ void process_command(struct iomessage message)
 	         {  sid = stdCard.id;
 	            scanType = 2; // standard ID
 				}
+            else if (UID_Not_Zero(unauthCard.id))
+            {  sid = unauthCard.id;
+            	scanType = 3; // unauthorized ID
+            }
 
 				if (UID_Not_Zero(sid) && ((MS_TIMER - lastSecureRemoveMsg)>500))
             {  // instead of INPUTS_ARE need to send SECURE_REMOVAL
@@ -1104,6 +1129,7 @@ void process_command(struct iomessage message)
          {
          	UID_Clear(secureCard.id);
 				UID_Clear(stdCard.id);
+				UID_Clear(unauthCard.id);
          }
 
       	break;
@@ -1264,7 +1290,7 @@ void process_command(struct iomessage message)
    {  // set blower for new state
       system_state=new_state;
 #ifdef USE_BLOWER
-      blower(blowerStateTable[system_state][blwrConfig]);
+      blower(blowerStateTable[system_state][0]); // remote always uses blwrconfig 0
 #endif
    }
 
@@ -1359,6 +1385,7 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
          if (isMyStation(UDPmessage.data[8]))
          {  UID_Clear(secureCard.id);  // clear secureCardID
             UID_Clear(stdCard.id);  // and standard card
+				UID_Clear(unauthCard.id);
          }
          malfunctionActive = (new_state == MALFUNCTION_STATE);
          systemDirection = UDPmessage.data[11];
@@ -1375,6 +1402,7 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
          {  handleSecure = FALSE;
          	UID_Clear(secureCard.id);
             UID_Clear(stdCard.id);
+				UID_Clear(unauthCard.id);
          }
          // handle some state changes
          if (transStation != lastTransStation)
@@ -1844,6 +1872,11 @@ int sendUDPHeartbeat(char sample)
    else if (UID_Not_Zero(stdCard.id))
    {  sid = stdCard.id;
 		HBmessage.data[8] = 2; // standard ID
+	   HBmessage.data[14] = 0; // no timing
+   }
+   else if (UID_Not_Zero(unauthCard.id))
+   {  sid = unauthCard.id;
+		HBmessage.data[8] = 3; // unauthorized ID
 	   HBmessage.data[14] = 0; // no timing
    }
    HBmessage.data[9] = *sid++; // secureCardID[0]

@@ -7,3 +7,12 @@
 .rom
 .bak
 .dbg
+*.brk
+*.HEX
+*.HDL
+*.BDL
+*.map
+*.rom
+*.DBG
+*.bmk
+*.org
