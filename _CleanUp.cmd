@@ -1,5 +1,6 @@
 del *.bdl /q
 del *.brk /q
+del *.bmk /q
 del *.hdl /q
 del *.bak /q
 del *.map /q
