@@ -76,6 +76,7 @@
    02-Jan-16   v417 Support for blower controlled by remote (vacuum pull)
    22-May-16   v418 Setup for card format parameter 26 or 40 bits
    					  cardNumbits = = param.cardFormat
+                    Changed lib\wiegand_v2.lib to accept 4-bit pin input
 
 ***************************************************************/
 #memmap xmem  // Required to reduce root memory usage
