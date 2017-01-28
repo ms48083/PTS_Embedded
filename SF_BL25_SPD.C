@@ -3,7 +3,7 @@
 SF_BL25_SPD.C  Used the BL2500 and the SF1016
 *************************************************************************/
 #define SPI_SER_C
-#define SPI_CLK_DIVISOR 20
+#define SPI_CLK_DIVISOR 20  // was 20
 
 #define SF1000_CS_PORT			PADR		// CS = PA0  J3:1 pulled high with
 													// 4.7K resistor.
@@ -13,7 +13,8 @@ SF_BL25_SPD.C  Used the BL2500 and the SF1016
 #define CS_ENABLE	 BitWrPortI ( SF1000_CS_PORT, &SF1000_CS_PORTSHADOW, 1, SF1000_CS_BIT );\
 	SPIxor = 0xFF;		// invert the received bits
 #define CS_DISABLE BitWrPortI ( SF1000_CS_PORT, &SF1000_CS_PORTSHADOW, 0, SF1000_CS_BIT );
-
+#define SF1000_DEBUG		debug
+#define SF1000_DEBUG_DELAY 7 // 7 is default in SF1000.lib
 #use SF1000.lib
 union
 {	char	cData[1024];
@@ -65,15 +66,20 @@ main()
 
 	printf ( "\n\nShort Test...............\n\r" );
 
-	TestBlock = SF1000_Nbr_of_Blocks/2 + 1;
-
+	TestBlock = 1; //SF1000_Nbr_of_Blocks/2 + 1;
+   i=5;
 	iLong = SF1000CheckWrites (TestBlock);
 
 	printf ( "\nBlock %d has been written %ld times\n\rWrite once more",
 		TestBlock, iLong );
 
 	FlashAddr = (long)(TestBlock)*SF1000_Block_size;
-	while ( SF1000Write ( FlashAddr, (char*)&i, 2 ) == -3 );
+	while ( (j=SF1000Write ( FlashAddr, (char*)&i, 2 )) != 0 )printf("\n%d",j);
+
+   printf ( "\nWrite result %d", j);
+   i=4;
+   while ( (j=SF1000Read( FlashAddr, (char*)&i, 2)) !=0)printf("\ni=%d j=%d",i,j);
+   printf ( "\nRead back value %d, status %d", i, j);
 
 	iLong = SF1000CheckWrites (TestBlock);
 	printf ( "\nBlock %d has been written %ld times\n\rWrite once more",

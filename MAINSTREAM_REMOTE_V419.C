@@ -1,5 +1,5 @@
 /*******************************************************************
-   MAINSTREAM_DIVERTER_V4xx.C   Colombo Semi-Automatic Pneumatic Tube Transfer System
+   MAINSTREAM_REMOTE_V4xx.C   Colombo Semi-Automatic Pneumatic Tube Transfer System
 
    Purpose:    Remote station control program.  Processes local i/o
                and main_station control commands.
@@ -34,7 +34,7 @@
    27-Mar-07   v342 Invert logic state of carrier in chamber and arrival optics
    31-Mar-07   v343 Revert to original logic of CIC and arrival optics
                     Set digital inputs low upon loss of connection to RN1100
-    10-Apr-07   v346 Set diverter addr-2 passthrough to port 4 instead of 1
+   10-Apr-07   v346 Set diverter addr-2 passthrough to port 4 instead of 1
    03-May-07   v347 Delay clearing of arrival latch for 1 second
 	04-May-07   v348 Fix handling of latched arrival
    24-May-07   v349 Fix bug in CIC lights not working, no IO Shift
@@ -57,42 +57,40 @@
 	16-Apr-08   v367 Fix mistake in initBlower:   blowerPosition==0 --> blowerPosition()==0
                     Return blowerPosition to the main station for head diverters with APU
    16-Aug-08   v400 Created from MAINSTREAM_REMOTE_V367.C
-   16-Nov-08   v403 Added diverter configuration 8, two position diverter, operates station 2, passes 3-7
+   			        Now handles only one dedicated station
+   19-Oct-08   v402 Clear request-to-send latch on setting diverter
+   16-Nov-08   v403 Fix up to operate point to point over RS485
    06-Dec-08   v404 Added handling of secure transaction
-   21-Dec-08   v405 Misc improvements to secure handling
-   03-Mar-09   v409 Bump version to 409
-   					  Add communication of secure card parameters
-   10-Apr-10   v410 Create new diverter configurations
-   						Head diverter using 3 ports: 1 for main, 2 for two sub-stations
-                     Standard diverter with no ports and two stations used with new head diverter config
-   18-Apr-10   v411 Fixes to allow for non-tcpip configurations
-   11-May-10   v412 Fix bug in using uninitialized msg_address in get_command - introduced in remote v3.19, jan 2007
-                    Allow the use of diverter_map 0 when calling set_diverter
-   26-Mar-11	v413 Pass Head Diverter arrival state always, not just in-process to allow for blocked optic msg
-                    When notified of purge mode, flash in-use and cic alternating
-   02-May-11   v414 Seems that as TRUE == 0x01 instead of 0xFF then passing latchCarrierArrival as TRUE does not satisfy
-                    the expected logic at the main system controller (needs to be a specific station)
-   06-Jun-11   v415 Fixed CIC outputs.  Missed the shifting of CIC outputs when it got reworked.
-   26-Aug-13   v416 New diverter configurations 11, 12, 13 for West Chester
-                    and pass through new card parameters
-   30-Dec-13   v417 Add user ID capability
-   06-Jun-14   v418 Send every card scan
-   24-Oct-15   v419 Point 2 Point; Delay enable of arrival interrupt for 2 seconds
-   22-May-16   v420 Renamed old card parameter to cardFormat
+   24-Dec-08   v405 Improve handling of secure transaction
+   30-Dec-08   v406 Improve robustness of secure transaction
+   05-Jan-09   v407 Fix handling of alert for door open during transaction
+   03-Mar-09   v408 Bump version to 409
+   					  Implement card parameters
+   19-Apr-11   v410 When notified of purge mode, flash in-use and cic alternating
+   07-Sep-13   v411 Additional card range block and parameters
+	31-Dec-13   v412 Add individual user identification
+   06-Jun-14   v413 Send every card scan
+   15-Aug-14   v414 Improve com when sending UID's; Set limit to 1100 users
+   15-Dec-14   v415
+   24-Oct-15   v416 Include Point-to-Point support (card data over RS485)
+   02-Jan-16   v417 Support for blower controlled by remote (vacuum pull)
+   22-May-16   v418 Setup for card format parameter 26 or 40 bits
+   					  cardNumbits = = param.cardFormat
+                    Changed lib\wiegand_v2.lib to accept 4-bit pin input
+   26-Jan-17   v419 Update mapping of 26 bit to right justify site code w/ card # (one big number)
+
 ***************************************************************/
 #memmap xmem  // Required to reduce root memory usage
 #class auto
-#define FIRMWARE_VERSION "DIVERTER V4.20"
-#define VERSION                       20
+#define FIRMWARE_VERSION "REMOTE V4.18"
+#define VERSION                     4
+#define SUBVERSION                  18
 
-// compile as "STANDARD" or "POINT2POINT" or "DIVERTERONLY" remote
-// STANDARD are directly connected where DIVERTERONLY are using dedicated remotes (TCPIP)
-#define RT_STANDARD     1
-#define RT_POINT2POINT  2
-#define RT_DIVERTERONLY 3
-//#define REMOTE_TYPE RT_STANDARD
-#define REMOTE_TYPE RT_DIVERTERONLY
+// compile as "STANDARD" or "POINT2POINT" remote
+#define RT_STANDARD    1
+#define REMOTE_TYPE RT_STANDARD
 //#define REMOTE_TYPE RT_POINT2POINT
+// For Point2Point do not use TCPIP.  Could fix this though (activeStations)
 
 //int lastcommand; // for debug
 #define USE_TCPIP 1
@@ -107,21 +105,22 @@
 #use "rnet_lcdif.lib"      RN1600 LCD library
 #define USE_BLOWER
 #use "MAINSTREAM.lib"      Mainstream v4xx function library
-
+//#define WIEGAND_DEBUG
+//#define WIEGAND_VERBOSE
+#use "wiegand_v2.lib"         RFID card reader interface
 // RabbitNet RN1600 Setup
 //int DevRN1600;                    // Rabbit Net Device Number Keypad/LCD
 int DevRN1100;                   // Rabbit Net Device Number Digital I/O
 //configure to sinking safe state
 #define OUTCONFIG 0xFFFF
-#define SHOW_CYCLE_TIME
 
 // Setup interrupt handling for carrier arrival input
 // Set equal to 1 to use fast interrupt in I&D space
 #define FAST_INTERRUPT 0
-char latchCarrierArrival;
+int latchCarrierArrival;
 void my_isr1();
 void arrivalEnable(char how);
-unsigned long arrivalEnableDelay;  // to delay enabling of arrival signal
+
 
 // Communications data structures
 #define NUMDATA   6
@@ -132,7 +131,6 @@ struct iomessage     /* Communications command structure */
    char station;
    char data[NUMDATA];
 };
-// set size needed to transmit parameters to remote or info to main
 #define NUMUDPDATA 18
 struct UDPmessageType  // UDP based messages
 {
@@ -145,87 +143,76 @@ struct UDPmessageType  // UDP based messages
 };
 // Define communications using TCP/IP (UDP)
 #ifdef USE_TCPIP
-//	#define UDP_DEBUG
-// #define DCRTCP_VERBOSE
-	#define TCPCONFIG 106         // need to use 100+ to use static IP defined here
+	#define TCPCONFIG 106         // 106 is an empty config for run-time setup
+   //#define USE_DHCP
+   //#define USE_ETHERNET 1
 	#define MAX_UDP_SOCKET_BUFFERS 1
 	#define DISABLE_TCP		// Not using TCP
-   #define MY_STATIC_IP "192.168.0.10"
-   #define MY_BASE_IP "192.168.0.2%d"
+   #define MY_STATIC_IP "192.168.0.11"
+   #define MY_BASE_IP "192.168.0.3%d"
    char myIPaddress[18];  // string to hold runtime IP address
 	#define MY_IP_NETMASK "255.255.255.0"
-	#define LOCAL_PORT   1234      // for inbound messages
+	#define LOCAL_PORT   1235      // for inbound messages
 //	#define REMOTE_IP    "255.255.255.255" //255.255.255.255" /*broadcast*/
-	#define REMOTE_PORT  1235      // for outbound messages
+	#define REMOTE_PORT  1234      // for outbound messages
 	#use "dcrtcp.lib"
 	udp_Socket sock;
-#endif
-// still define the function prototypes
 	int sendUDPHeartbeat(char sample);
 	int sendUDPcommand(struct UDPmessageType message);
 	int getUDPcommand(struct UDPmessageType *message);
 	void processUDPcommand(struct UDPmessageType message);
-	void processUDPio(void);
-	void monitorUDPactivity(char deviceID);
-   void sendUDPCardParameters(void);
-
-
+#endif
 // Including parameter block structure
 // Parameters are NOT read to / written from FLASH
+#define UIDSize 1000
+// UIDLen more than 5 is not supported by UID_Send due to command length limit
+#define UIDLen  5
+
 struct par_block_type
 {  // These parameters are defined on the fly at run-time
    char opMode;      // STD_REMOTE or HEAD_DIVERTER
    char subStaAddressing; // to indicate if substation can select slave for destination
    char blowerType;
    char portMapping;
-   char cardFormat;     // 26 or 40 bits
-	unsigned long cardR9Min;  // Secure card ID minimum value for the right 9 digits
-   unsigned long cardR9Max;  // Secure card ID maximum value for the right 9 digits
-   char card2L3Digits;     // Constant left 3 digits of valid secure cards
-	unsigned long card2R9Min;  // Secure card ID minimum value for the right 9 digits
-   unsigned long card2R9Max;  // Secure card ID maximum value for the right 9 digits
-   char cardCheckEnabled;  // enable checking individual card numbers
+   //char cardL3Digits;     // Constant left 3 digits of valid secure cards
+	//unsigned long cardR9Min;  // Secure card ID minimum value for the right 9 digits
+   //unsigned long cardR9Max;  // Secure card ID maximum value for the right 9 digits
+   //char card2L3Digits;     // Constant left 3 digits of valid secure cards
+	//unsigned long card2R9Min;  // Secure card ID minimum value for the right 9 digits
+   //unsigned long card2R9Max;  // Secure card ID maximum value for the right 9 digits
+	char cardCheckEnabled;  // enable individual card id checking
+   char cardFormat;        // defines type of card (26 or 40 bits)
+   char reserved[98];
+   unsigned long UIDSync; // timestamp (seconds) since last good block
+   char UID[UIDSize][UIDLen];
 } param;
 #define STD_REMOTE    0
 #define HEAD_DIVERTER 1
-#define HEAD_DIVERTER2 2
-char mainStation;
 #define SLAVE   0x08      // Station number of the slave
 #define SLAVE_b 0x80      // Bit representation
 
-#define NUM_STATIONS 8
-char THIS_DEVICE;         // board address for communications and setup
+char THIS_DEVICE;       // board address for communications and setup
+char THIS_DEVICE_b;
 char MY_STATIONS;       // to mask supported stations
 char IO_SHIFT;          // to map expansion board i/o
 char diverter_map[9];   // to assign diverter positions to stations
-char activeStations;    // to track who is out there and active
 
 // Global variables
 unsigned long thistime, lasttime, lost;
-char securePIN_hb, securePIN_lb;
-#define UIDLen  5
-struct {
-	//unsigned long id;
-   char id[UIDLen];
-   char time;
-   char scanType; // 1=secure; 2=standard; 3=unauthorized
-} secureCard[10];
-char secureAck;
-char nextSecureStation(void);
-//unsigned long secureCardID[10];
+
 /* Declare general function prototypes */
 void msDelay(unsigned int msec);
 //char bit2station(char station_b);// station_b refers to bit equivalent: 0100
 //char station2bit(char station);  // station refers to decimal value: 3 --^
 void init_counter(void);
 void process_local_io(void);
-void processCycleTime(void);
 void set_remote_io(char *remotedata);
 void init_io(void);
 void exercise_io(void);
 void send_response(struct iomessage message);
 char get_command(struct iomessage *message);
 void process_command(struct iomessage message);
+void processCardReads(void);
 void enable_commands(void);
 void arrival_alert(char code, char station);
 char isMyStation(char station);
@@ -242,12 +229,6 @@ char carrierArrival(char station_mask);
 char requestToSend(char station_mask);
 char requestToSend2(char station_mask);
 //char diverter_pos(void);
-// Declare global equivalents for inputs coming from dedicated remotes (UDP)
-char g_carrierInChamber;
-char g_doorClosed;
-char g_carrierArrival;
-char g_requestToSend;
-char g_requestToSend2;
 
 /* Declare local and expansion bus output prototypes */
 char rts_latch;      // Used for latching requestToSend
@@ -255,26 +236,23 @@ char rts2_latch;     // Used for latching 2nd requestToSend (to slave)
 void inUse(char how, char station_b);
 void alert(char how, char station_b);
 void alarm(char how);
+void doorAlert(char how);
+void unlockDoor(void);
 // void diverter(char how);
-void setDiverter(char station);
-void processDiverter(void);
+//void setDiverter(char station);
+//void processDiverter(void);
 void setDiverterMap(char portMap);
 
 // USER ID MANAGEMENT DEFINITIONS
-//int UID_Add(char *ID);
-//int UID_Del(char *ID);
-//int UID_Search(char *ID);
-//int UID_Get(int UIndex);
-//int UID_Send(char *ID, char how);
-//unsigned int UID_Cksum();
+int UID_Add(char *ID);
+int UID_Del(char *ID);
+int UID_Search(char *ID);
+int UID_Get(int UIndex);
+unsigned int UID_Cksum();
 int UID_Decode(char *UID, char *Result);
-//int UID_Encode(char *UID, char *Result);
-//int UID_Parse(char *UIDBuffer);
-//int UID_ResyncAll(void);
-//unsigned long cvtTime(char *timestring);
+int UID_Encode(char *UID, char *Result);
 int UID_Not_Zero(char *UID);
 void UID_Clear(char *UID);
-
 
 // Declare watchdog and powerlow handlers
 char watchdogCount(void);
@@ -282,6 +260,7 @@ char powerlowCount(void);
 void incrementWDCount(void);
 void incrementPLCount(void);
 void loadResetCounters(void);
+void checkMalfunction(void);
 
 // Digital I/O definitions
 char outputvalue [6];   // buffer for some outputs
@@ -294,57 +273,45 @@ int readDigBank(char bank);  // banks 0,1 on Coyote; banks 2,3 on RN1100
 #define dio_ON  0
 #define dio_OFF 1
 #define di_HDArrival					  readDigInput(0)
-// Check for and setup point to point configuration
-#if REMOTE_TYPE == RT_POINT2POINT
-	#warnt "Compiling as point-to-point configuration"
-	#define di_carrierArrival          readDigInput(0)
-	#define di_requestToSend           readDigInput(1)
-	#define di_requestToSend2          0
-	#define di_doorClosed              readDigInput(2)
-	#define di_carrierInChamber        readDigInput(3)
-#endif
-#if REMOTE_TYPE == RT_STANDARD
-	#define di_carrierArrival          (((readDigBank(0)) & 0x1E) >> 1)
-	#define di_carrierInChamber        (((readDigBank(1)) & 0xF0) >> 4)
-	#define di_requestToSend           (readDigBank(2) & 0x0F)
-	#define di_requestToSend2          (readDigBank(3) & 0x0F)
-	#define di_doorClosed              ((readDigBank(2) & 0xF0) >> 4)
-#endif
-#if REMOTE_TYPE == RT_DIVERTERONLY
-	// define di_carrierArrival only to support definition in my_isr1
-	#define di_carrierArrival          readDigInput(0)
-#endif
-#define di_remoteAddress           ((readDigBank(0) & 0xE0) >> 5)
+#define di_carrierArrival          readDigInput(0)
+#define di_requestToSend           readDigInput(1)
+#define di_requestToSend2          readDigInput(8)
+#define di_doorClosed              readDigInput(2)
+#define di_carrierInChamber        readDigInput(3)
+#define di_remoteAddress           ((readDigBank(0) & 0xF0) >> 4)
+/* BLOWER BUT NO DIVERTER IN THIS VERSION
+#define USE_DIVERTER
+#define USE_BLOWER
 #define di_diverterPos             (readDigBank(1) & 0x0F)
-#define di_shifterPosIdle          readDigInput(12)
-#define di_shifterPosPrs           readDigInput(13)
-#define di_shifterPosVac           readDigInput(14)
+*/
+#define di_shifterPosIdle          1
+#define di_shifterPosPrs           0
+#define di_shifterPosVac           0
+
 
 // OUTPUTS
 void setDigOutput(int channel, int value);
 #define do_shift 0
-// Check for and setup point to point configuration
-#if REMOTE_TYPE == RT_POINT2POINT
-	#define do_doorAlert(which,value)    setDigOutput(0,value)
-	#define do_arrivalAlert(which,value) setDigOutput(1,value)
-	#define do_CICLight(which,value)     setDigOutput(2,value)
-	#define do_inUseLight(which,value)   setDigOutput(3,value)
-   // inUseLight on output 3,4,7 causes RS485 transmitter to enable (PA4)
-   // Root cause was use of static CHAR elements in maintenance() instead of static INT
-#endif
-#if REMOTE_TYPE == RT_STANDARD
-	#define do_doorAlert(which,value)    setDigOutput(0+do_shift+which,value)
-	#define do_arrivalAlert(which,value) setDigOutput(8+do_shift+which,value)
-	#define do_inUseLight(which,value)   setDigOutput(12+do_shift+which,value)
-	#define do_inUse2Light(which,value)  setDigOutput(20+do_shift+which,value)
-	#define do_CICLight(which,value)     setDigOutput(16+do_shift+which,value)
-#endif
-#define do_diverter(value)           setDigOutput(4+do_shift,value)
+#define do_doorAlert(which,value)    setDigOutput(0,value)
+#define do_arrivalAlert(which,value) setDigOutput(1,value)
+#define do_CICLight(which,value)     setDigOutput(2,value)
+#define do_inUseLight(which,value)   setDigOutput(3,value)
+#define do_doorUnLock(value)   		 setDigOutput(4,value)
+//#define do_inUseLight2(which,value)  setDigOutput(5,value)
+// for remotes, vac and prs are reversed (prs=O5; vac=O6)
+#define do_blowerVac(value)          setDigOutput(5,value)
+#define do_blowerPrs(value)          setDigOutput(6,value)
+#define do_blower(value)
+#define do_secureTransLight(value)   setDigOutput(7,value)
+// inUseLight on output 3,4,7 causes RS485 transmitter to enable (PA4)
+// Root cause was use of static CHAR elements in maintenance() instead of static INT
 //#define do_alarm(value)              setDigOutput(xx+do_shift,value)
+/*  BLOWER BUT NO DIVERTER IN THIS VERSION
+#define do_diverter(value)           setDigOutput(4+do_shift,value)
 #define do_blower(value)             setDigOutput(5+do_shift,value)
 #define do_blowerVac(value)          setDigOutput(6+do_shift,value)
 #define do_blowerPrs(value)          setDigOutput(7+do_shift,value)
-
+*/
 
 #define ALARM_MASK           0x20
 // #define beep(value)                rn_keyBuzzerAct(DevRN1600, value, 0)
@@ -425,8 +392,36 @@ void alarm(char how);
 #define DIVERTER_TIMEOUT  30000        // How long to set diverter
                    // May be longer than mainsta timeout
 /******************************************************************/
+// Define various globals
+char mainStation;
 char arrival_from;          // indicates if main is ready for receive or in arrival alert
+char transStation, diverterStation;
+char malfunctionActive;
+char carrier_attn, carrier_attn2;
+char system_state, systemDirection;
+#define FLAG_SECURE      0x20
+char transFlags;
+char handleSecure;
+char gotCardRead;
+char gotPinRead;
+int securePIN;
+unsigned long cardID_hb, cardID_lb;
+int cardNumbits;
+void cardReaderInit();
+//#define CARDHBOFFSET  119
+//#define CARDLBOFFSET  3676144640
+// offset to get printed card id number
+//#define CARDBASE 0xE8777C00
 char purge_mode;            // indicates if main is in purge mode (flash lights differently)
+
+//unsigned long secureCardID;
+//unsigned long secureCardTime;
+struct {
+	//unsigned long id;
+   char id[UIDLen];  // same as UIDLen
+   unsigned long time;
+} secureCard, stdCard, unauthCard;
+unsigned long arrivalTime;
 
 /* Array index values for remote data, returned by INPUTS_ARE command. */
 #define REMOTE_CIC      0
@@ -438,13 +433,17 @@ char purge_mode;            // indicates if main is in purge mode (flash lights 
 main()
 {  int i;
    unsigned long timeout;
-   struct iomessage message;
    unsigned long heartbeat_timer;
    unsigned long heartbeat_interval;
+   struct iomessage message;
    struct UDPmessageType UDPmessage;
    char key, simonsays;
    auto rn_search newdev;
    int status;
+char UID[15];
+//	unsigned long R[2];
+//	unsigned short fac, id;
+//	int wr;
 
    /* Initialize i/o */
    loadResetCounters();  // load counters for watchdog and powerlow resets
@@ -472,12 +471,8 @@ main()
 
    /* read board address and set configuration i/o mappings */
    THIS_DEVICE = (di_remoteAddress);
+   THIS_DEVICE_b = station2bit(THIS_DEVICE);
    //if (PRINT_ON) printf("\nThis is remote plc # %d", THIS_DEVICE);
-
-   // Check for and setup point to point configuration
-   #if REMOTE_TYPE == RT_POINT2POINT
-		THIS_DEVICE = 1;
-   #endif
 
    // flash the plc number
    //flasher(0);
@@ -488,6 +483,7 @@ main()
       ledOut(0,0);
       hitwd();
    }
+   // if (PRINT_ON) printf("\nWD and PL Reset Counters %d  %d", watchdogCount(), powerlowCount());
    // Set the diverter mapping based on the Remote ID#
    setDiverterMap(param.portMapping);
 
@@ -496,10 +492,7 @@ main()
       interrupt_vector ext1_intvec my_isr1;
    #else
       SetVectExtern3000(1, my_isr1);
-      // re-setup ISR's to show example of retrieving ISR address using GetVectExtern3000
-      //SetVectExtern3000(1, GetVectExtern3000(1));
    #endif
-   // WrPortI(I1CR, &I1CRShadow, 0x09);      // enable external INT1 on PE1, rising edge, priority 1
    arrivalEnable(FALSE);  // Disable for now
 
 #ifdef USE_TCPIP
@@ -523,27 +516,50 @@ main()
    }
 #endif
 
-   // if (PRINT_ON) printf("\nWD and PL Reset Counters %d  %d", watchdogCount(), powerlowCount());
+   // flash output lamps
    exercise_io();
 
-   /* Initialize serial port 1 */
+   // Initialize serial port 1
    enable_commands();
+
+   // Initialize card reader
+   cardReaderInit();
+   // Input capture 0, zero bit on port F:3, one bit port F:5, 26 bits
+   //cardNumbits=40;
+   //cardNumbits=26;
+//   cardNumbits=param.cardFormat;
+//  if (wiegand_init(3, PFDR, 3, PFDR, 5, cardNumbits))
+//   	printf("Card reader init failed\n");
+
+
+// dump UID's
+//for (i=0; i<UIDSize; i++)
+//{  if (UID_Not_Zero(param.UID[i]))
+//	{  UID_Decode(param.UID[i], UID);
+//		printf("%d %s\n", i, UID);
+//   }
+//}
 
    thistime=MS_TIMER;
    lost=0;
-  	heartbeat_interval=500;
+	heartbeat_interval=100;
    simonsays=TRUE;
    while(simonsays)
    {  // loop forever
 
-      maintenance();  // Hit WD, flash LEDs, write outputs
+      // check card for data
+/*     	wr = wiegand_result(3, NULL, R);
+     	if (wr == WIEGAND_OK) {
+       fac = (unsigned short)(R[1] >> 4);
+       id = (unsigned short)(R[0] |
+                            (R[1] & 0x0F) << 12);
+      }
+*/
+      maintenance();  // Hit WD, flash LEDs, write outputs, tcp tick
 
       /* check for and process incoming commands */
       if (get_command(&message)) process_command(message);
       if (getUDPcommand(&UDPmessage) > 0) processUDPcommand(UDPmessage);
-
-      /* check for and process remote stations with dedicated processors*/
-      //processUDPio();
 
       /* check for and process local inputs */
       process_local_io();
@@ -553,27 +569,55 @@ main()
       {  // Send a UDP heartbeat
 	      sendUDPHeartbeat(1);
          heartbeat_timer=MS_TIMER;
-		   monitorUDPactivity(0);  // force a refresh of station activity in case all are off
       }
-#ifdef SHOW_CYCLE_TIME
-	   processCycleTime();
-#endif
 
    } /* end while */
 }
 /********************************************************/
-char transStation, diverterStation, transFlags;
-char carrier_attn, carrier_attn2;
-char system_state, systemDirection;
-//char remote_stat_alert;
 //unsigned long arrival_time;
-/********************************************************/
-char whichCA;
+//char whichCA;
+unsigned long arrivalDuration;
+char arrivalISRstate;
+#define AISR_RISING 1
+#define AISR_FALLING 2
 nodebug root interrupt void my_isr1()
 {
-   latchCarrierArrival=activeStations; // can't tell which station so send via all
-   whichCA=di_carrierArrival; //carrierArrival(255);
+/*
+   latchCarrierArrival=TRUE;
+   //whichCA=di_carrierArrival; //carrierArrival(255);
    WrPortI(I1CR, &I1CRShadow, 0x00);      // disble external INT1 on PE1
+*/
+	// New concept ...
+   // arrivalEnable sets up for falling edge interrupt
+   // Detect that here and then reverse setup to detect rising edge
+   // Once rising edge detected then validate duration
+   // If duration is good (> x ms) then latch and disable interrupt
+   // Otherwise reset interrupt for rising edge since it was previously active
+	if (arrivalISRstate == AISR_FALLING)  // Carrier has entered optic zone
+   {  // Setup to detect rising edge
+		WrPortI(I1CR, &I1CRShadow, 0x0A);
+      arrivalDuration = MS_TIMER;
+      arrivalISRstate = AISR_RISING;
+   } else if (arrivalISRstate == AISR_RISING) // Carrier has left optic zone
+   {  //
+		WrPortI(I1CR, &I1CRShadow, 0x00);  // disable interrupt
+      arrivalDuration = MS_TIMER - arrivalDuration;
+      arrivalISRstate = 0;  // No more activity
+      if (arrivalDuration > 10) latchCarrierArrival=TRUE;  // Got a good arrival
+      // note: 10 ms pulse for a 12 inch carrier is 100 FPS or 61.4 MPH
+      else
+      {  WrPortI(I1CR, &I1CRShadow, 0x06);  // Too short, reset for another try
+         arrivalISRstate = AISR_FALLING;
+      }
+   }
+}
+void cardReaderInit()
+{
+   // Initialize card reader
+   // Input capture 0, zero bit on port F:3, one bit port F:5, 26 bits
+   cardNumbits=param.cardFormat;
+   if (wiegand_init(3, PFDR, 3, PFDR, 5, cardNumbits))
+   	printf("Card reader init failed\n");
 }
 void arrivalEnable(char how)
 {
@@ -586,12 +630,13 @@ void arrivalEnable(char how)
 
    latchCarrierArrival=FALSE;    // clear existing latch
    if (how)
-   {   //outport(ITC,(inport(ITC))|0x02);      // enable  INT1
-      //WrPortI(I1CR, &I1CRShadow, 0x09);      // enable external INT1 on PE1, rising edge, priority 1
-   	WrPortI(I1CR, &I1CRShadow, 0x0A);		// enable external INT1 on PE1, rising and falling edge, priority 2
+   {	// enable  INT1
+   	WrPortI(I1CR, &I1CRShadow, 0x06);		// enable external INT1 on PE1, falling edge, priority 2
+      arrivalISRstate = AISR_FALLING;
    } else
-   {   //outport(ITC,(inport(ITC))&~0x02);     // disable INT1
+   {  // disable INT1
       WrPortI(I1CR, &I1CRShadow, 0x00);      // disble external INT1 on PE1
+      arrivalISRstate = 0;
    }
 }
 
@@ -599,189 +644,19 @@ void setDiverterMap(char portMap)
 {	// Sets up the diverter port mapping based on the supplied parameter
 	// Also sets the parameter opMode to standard or head-diverter
    // Entry in diverter_map is the binary diverter port number (1,2,4,8)
-   param.opMode = STD_REMOTE;
-   switch (portMap)
-   {
-      case 0:
-         break;
-      case 1:
-         MY_STATIONS = 0x0F;     // mask for stations used by this device
-         IO_SHIFT = 0;           // 4 for stations 5-7, 0 for stations 1-3
-         diverter_map[0] = 0; diverter_map[1] = 1;
-         diverter_map[2] = 2; diverter_map[3] = 4;
-         diverter_map[4] = 8; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-	      // Check for and setup point to point configuration
-	      #if REMOTE_TYPE == RT_POINT2POINT
-	         MY_STATIONS = 0x01;     // mask for stations used by this device
-	         diverter_map[2] = 0; diverter_map[3] = 0; diverter_map[4] = 0;
-         #endif
-         break;
-      case 2:
-         MY_STATIONS = 0x70;     // mask for stations used by this device
-         IO_SHIFT = 4;           // 4 for stations 5-7, 0 for stations 1-3
-         diverter_map[0] = 0; diverter_map[1] = 8;
-         diverter_map[2] = 8; diverter_map[3] = 8;
-         diverter_map[4] = 8; diverter_map[5] = 1;
-         diverter_map[6] = 2; diverter_map[7] = 4;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 3:
-         MY_STATIONS = 0x03;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 1;
-         diverter_map[2] = 2; diverter_map[3] = 4;
-         diverter_map[4] = 4; diverter_map[5] = 8;
-         diverter_map[6] = 8; diverter_map[7] = 8;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 4:
-         MY_STATIONS = 0x0C;     // mask for stations used by this device
-         IO_SHIFT = 2;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 0;
-         diverter_map[2] = 0; diverter_map[3] = 1;
-         diverter_map[4] = 2; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 5:
-         MY_STATIONS = 0x70;     // mask for stations used by this device
-         IO_SHIFT = 4;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 0;
-         diverter_map[2] = 0; diverter_map[3] = 0;
-         diverter_map[4] = 0; diverter_map[5] = 1;
-         diverter_map[6] = 2; diverter_map[7] = 4;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 6:
-         MY_STATIONS = 0x01;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 1;
-         diverter_map[2] = 2; diverter_map[3] = 2;
-         diverter_map[4] = 2; diverter_map[5] = 2;
-         diverter_map[6] = 2; diverter_map[7] = 2;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 7:  // HEAD DIVERTER USE ONLY
-         param.opMode = HEAD_DIVERTER;
-         MY_STATIONS = 0x80;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 1;
-         diverter_map[2] = 2; diverter_map[3] = 4;
-         diverter_map[4] = 0; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         initBlower();  // only head diverter uses a blower
-         break;
-      case 8: // Operate station 2, ignore station 1, pass through stations 3-7
-         MY_STATIONS = 0x02;     // mask for stations used by this device
-         IO_SHIFT = 1;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 0;
-         diverter_map[2] = 1; diverter_map[3] = 2;
-         diverter_map[4] = 2; diverter_map[5] = 2;
-         diverter_map[6] = 2; diverter_map[7] = 2;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 9:  // HEAD DIVERTER USE ONLY - ALTERNATE CONFIGURATION
-         param.opMode = HEAD_DIVERTER2;
-         MY_STATIONS = 0x80;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 1; diverter_map[1] = 2;
-         diverter_map[2] = 4; diverter_map[3] = 0;
-         diverter_map[4] = 0; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         initBlower();  // only head diverter uses a blower
-         break;
-      case 10:  // for use with head diverter configuration #9
-         // controls station 1 & 2 but no actual diverter
-         MY_STATIONS = 0x03;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 0;
-         diverter_map[2] = 0; diverter_map[3] = 0;
-         diverter_map[4] = 0; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 11:
-         MY_STATIONS = 0x03;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 1;
-         diverter_map[2] = 2; diverter_map[3] = 0;
-         diverter_map[4] = 0; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 12:
-         MY_STATIONS = 0x10;     // mask for stations used by this device
-         IO_SHIFT = 4;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 2;
-         diverter_map[2] = 2; diverter_map[3] = 2;
-         diverter_map[4] = 2; diverter_map[5] = 1;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 13:
-         MY_STATIONS = 0x00;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 1;
-         diverter_map[2] = 1; diverter_map[3] = 2;
-         diverter_map[4] = 2; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         break;
-      case 14:
-         MY_STATIONS = 0x0F;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 4;
-         diverter_map[2] = 2; diverter_map[3] = 4;
-         diverter_map[4] = 8; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         break;
-      default:   // any other undefined selection
-         MY_STATIONS = 0x00;     // mask for stations used by this device
-         IO_SHIFT = 0;           // maps i/o 1-4 to stations x-x
-         diverter_map[0] = 0; diverter_map[1] = 0;
-         diverter_map[2] = 0; diverter_map[3] = 0;
-         diverter_map[4] = 0; diverter_map[5] = 0;
-         diverter_map[6] = 0; diverter_map[7] = 0;
-         diverter_map[8] = 0; // for main to main
-         break;
-   }
-#ifndef USE_TCPIP
-	activeStations = MY_STATIONS;
-#endif
-}
-#ifdef SHOW_CYCLE_TIME
-void processCycleTime()
-{  // calculate and display cycle time statistics
-#define CYCLETIME_UPDATE 2000
-   static int ct_min, ct_avg, ct_max;
-   static int ct_loops;
-   static unsigned long cycle_start;
-   static unsigned long ct_last;
-   unsigned long cycle_time;
 
-   if (MS_TIMER - cycle_start >= CYCLETIME_UPDATE)
-   {  if (ct_loops > 0) ct_avg = (int)((MS_TIMER - cycle_start) / ct_loops);
-      printf("\n n=%d min=%d avg=%d max=%d", ct_loops, ct_min, ct_avg, ct_max);
-      ct_max=0;
-      ct_min=32767;
-      ct_loops=0;
-      cycle_start=MS_TIMER;
-   }
-   else
-   {
-      cycle_time = MS_TIMER - ct_last;
-      ct_loops = ct_loops + 1;
-      if (cycle_time > ct_max) ct_max = (int)cycle_time;
-      if (cycle_time < ct_min) ct_min = (int)cycle_time;
-   }
-   ct_last = MS_TIMER;
+	// At the moment, station number is tied to device number
+	param.opMode = STD_REMOTE;
+	MY_STATIONS = 1; //THIS_DEVICE;
+	IO_SHIFT = 0;
+	diverter_map[0] = 0; diverter_map[1] = 0;
+	diverter_map[2] = 0; diverter_map[3] = 0;
+	diverter_map[4] = 0; diverter_map[5] = 0;
+	diverter_map[6] = 0; diverter_map[7] = 0;
+	diverter_map[8] = 0; // for main to main
+   initBlower();  // put this here to be similar to diverter software
+
 }
-#endif
 
 void init_io()
 {
@@ -791,11 +666,20 @@ void init_io()
       outputvalue[i] = 0;
       remoteoutput[i] = 0;
    }
+#ifdef USE_BLOWER
    blower(blwrOFF);
+#endif
    alarm(OFF);
-   secureAck=0;
-   //for (i=0; i<10; i++) secureCard[i].id=0;
-   for (i=0; i<10; i++) UID_Clear(secureCard[i].id);
+   do_doorUnLock(OFF);
+   //secureCard.id=0;
+   UID_Clear(secureCard.id);
+   UID_Clear(stdCard.id);
+   UID_Clear(unauthCard.id);
+   secureCard.time=0;
+   stdCard.time=0;
+   unauthCard.time=0;
+   handleSecure=FALSE;
+   arrivalTime=0;
    purge_mode=0;
 }
 void exercise_io()
@@ -844,24 +728,15 @@ void process_local_io()
       //LA_Timer=0;
       mainStation=0;
       param.subStaAddressing=FALSE;
-	   g_carrierInChamber=0;
-	   g_doorClosed=0;
-	   g_carrierArrival=0;
-	   g_requestToSend=0;
-	   g_requestToSend2=0;
-      arrivalEnableDelay=0;
-   }
-
-   // Check for delayed arrivalEnable
-   if ((arrivalEnableDelay > 0) && (MS_TIMER - arrivalEnableDelay > 2000))
-   {  arrivalEnable(TRUE);
-   	arrivalEnableDelay = 0;
    }
 
    /* Check for diverter and blower attention */
+#ifdef USE_DIVERTER
    processDiverter();
+#endif
+#ifdef USE_BLOWER
    processBlower();
-
+#endif
    /* Use local buffers for some inputs */
    if (param.opMode == STD_REMOTE)
    {  // stuff for standard remote inputs
@@ -870,19 +745,18 @@ void process_local_io()
       cic_data=carrierInChamber(MY_STATIONS);
       door_closed=doorClosed(MY_STATIONS);
 
-      // handle carrier in chamber light
-      // Need to shift CIC input back to (1..4) range for correct output
+      /* Latch request_to_send for new requests */
+      //rts_latch |= (rts_data & cic_data & door_closed) & ~carrier_attn & ~rts2_data;  // de-latch when rts2 pressed
+      //rts2_latch |= (rts2_data & cic_data & door_closed) & ~carrier_attn2 & ~rts_data;  // de-latch when rts pressed
       // don't latch inputs if in purge mode
       if (purge_mode==0)
       {
-	      /* Latch request_to_send for new requests */
-	      rts_latch |= (rts_data & cic_data & door_closed) & ~carrier_attn & ~rts2_data;  // de-latch when rts2 pressed
-	      rts2_latch |= (rts2_data & cic_data & door_closed) & ~carrier_attn2 & ~rts_data;  // de-latch when rts pressed
+	      rts_latch |= (rts_data) & ~carrier_attn & ~rts2_data;  // de-latch when rts2 pressed
+   	   rts2_latch |= (rts2_data) & ~carrier_attn2 & ~rts_data;  // de-latch when rts pressed
       }
-
-      /* Don't latch requests from station in current transaction */
-      rts_latch &= ~station2bit(transStation);
-      rts2_latch &= ~station2bit(transStation);
+      /* Clear latch requests from station in current transaction */
+      rts_latch &= (isMyStation(transStation) | isMyStation(diverterStation)) ? 0 : 1;
+      rts2_latch &= (isMyStation(transStation) | isMyStation(diverterStation)) ? 0 : 1;
 
       /* Turn off those who have lost their carrier or opened door */
       rts_latch &= cic_data;
@@ -891,39 +765,48 @@ void process_local_io()
       rts2_latch &= door_closed;
 
       // Setup in-use lights for primary and optional secondary in-use lights
-      on_bits    = station2bit(transStation);
+      on_bits    = isMyStation(transStation) ? 1 : 0;
       flash_bits = rts_latch | rts_data;
       flash_bits |= ~door_closed;  // flash open doors
       flash_bits |= carrier_attn; // flash stations needing attention  (unremoved delivery)
-      on_bits2    = station2bit(transStation);
+      on_bits2    = isMyStation(transStation) ? 1 : 0;
       flash_bits2 = rts2_latch | rts2_data;
       flash_bits2 |= ~door_closed;  // flash open doors
       flash_bits2 |= carrier_attn2; // flash stations needing attention  (unremoved delivery)
       if ((mainStation==SLAVE) && (param.subStaAddressing==TRUE))
-      		flash_bits2 |= station2bit(diverterStation);
-      else  flash_bits |= station2bit(diverterStation);
+      		flash_bits2 |= isMyStation(diverterStation) ? 1 : 0;
+      else  flash_bits |= isMyStation(diverterStation) ? 1 : 0;
 
-// NEED TO LOOK INTO HOW ARRIVAL_FROM WORKS
       // if main arrival active, flash inuse at who sent to main
-      if (arrival_from)
-      {  on_bits &= ~arrival_from;   // Not on solid
-         flash_bits |= arrival_from; // On flash instead
+      if (arrival_from & THIS_DEVICE_b)
+      {  on_bits =0; //&= ~arrival_from;   // Not on solid
+         flash_bits =1; //|= arrival_from; // On flash instead
       }
+      // Now ensure on bits overrides flash bits
+      flash_bits &= ~on_bits;
+      flash_bits2 &= ~on_bits2;
 
       // set the in use lights as necessary
-      inUse(OFF, ~on_bits & ~flash_bits & MY_STATIONS & ~station2bit(transStation));
+      //inUse(OFF, ~on_bits & ~flash_bits & MY_STATIONS & ~station2bit(transStation));
+      //inUse(FLASH, flash_bits & ~station2bit(transStation));
+      inUse(OFF, ~on_bits & ~flash_bits);
       inUse(ON, on_bits);
-      inUse(FLASH, flash_bits & ~station2bit(transStation));
-      inUse2(OFF, ~on_bits2 & ~flash_bits2 & MY_STATIONS & ~station2bit(transStation));
+      inUse(FLASH, flash_bits);
+      //inUse2(OFF, ~on_bits2 & ~flash_bits2 & MY_STATIONS & ~station2bit(transStation));
+      //inUse2(FLASH, flash_bits2 & ~station2bit(transStation));
+      inUse2(OFF, ~on_bits2 & ~flash_bits2);
       inUse2(ON, on_bits2);
-      inUse2(FLASH, flash_bits2 & ~station2bit(transStation));
+      inUse2(FLASH, flash_bits2);
 
 	   // latch the arrival signal
-      if (arrivalEnableDelay == 0)
-      {  // only if no delay is active
-	      i = carrierArrival(MY_STATIONS);
-		   if (i) latchCarrierArrival=i;     // latch this value
-      }
+////	   if (carrierArrival(MY_STATIONS)) latchCarrierArrival=TRUE;     // latch this value
+
+      // locally handle the alert for door open during transaction
+      if (door_closed) doorAlert(OFF);
+      else if (isMyStation(transStation)) doorAlert(ON);
+
+      // Check for and process door unlock
+      processCardReads();
 
    } else
    {  // stuff for head diverter
@@ -936,22 +819,138 @@ void process_local_io()
    }
 
 }
+void processCardReads(void)
+{  // check for card or pin read and latch in gotCardRead or gotPinRead
 
+	unsigned long R[2];
+	int wr, PIN;
+	unsigned long test;
+	unsigned long test2;
+	char Buf[14];
+	static char Uid[5];
+
+   // check for card read
+	wr = wiegand_result(3, NULL, R);
+	if (wr == WIEGAND_OK)
+   {  // got a card read
+   	if (cardNumbits == 40)
+      {	cardID_lb = R[0] | (R[1] << 19); // first 32 bits
+	      cardID_hb = R[1] >> 13;
+      } else if (cardNumbits == 26)
+      {  cardID_lb = (R[0] | (R[1] << 12)) & 0xFFFFFF;  // card number (16 bits) w/ site code
+      	cardID_hb = 0;//(R[1] >> 4);                      // site code (8 bits)
+      } else // unknown format
+      {  cardID_lb = 0;
+         cardID_hb = 0;
+      }
+      // stuff lb,hb into Uid
+	   Uid[0] = (char)cardID_hb;
+	   Uid[1] = (char)((cardID_lb >> 24) & 0xFF);
+	   Uid[2] = (char)((cardID_lb >> 16) & 0xFF);
+	   Uid[3] = (char)((cardID_lb >>  8) & 0xFF);
+	   Uid[4] = (char)((cardID_lb)       & 0xFF);
+		UID_Decode(Uid, Buf);
+      printf(" Got Card %lX %lX -> %s\n", cardID_hb, cardID_lb, Buf);
+      // check against card block 1 or 2
+///      if ( (((cardID_hb+CARDHBOFFSET) == param.cardL3Digits)
+///         && ((cardID_lb-CARDLBOFFSET) >= param.cardR9Min)
+///         && ((cardID_lb-CARDLBOFFSET) <= param.cardR9Max))
+///        || (((cardID_hb+CARDHBOFFSET) == param.card2L3Digits)
+///         && ((cardID_lb) >= param.card2R9Min)
+///         && ((cardID_lb) <= param.card2R9Max)) )
+
+		///if ((param.cardCheckEnabled == FALSE) || (UID_Search(Uid) >= 0))
+      ///{  printf(" Card is valid\n");
+	   ///   gotCardRead = TRUE;
+      ///}
+      gotCardRead = TRUE; // Always accept a card read regardless of param and search
+
+	} //else if (gotCardRead==FALSE) secureCardID = 0; // only clear if not pending xmit
+
+   // check for PIN read if in a secure transaction
+   if (handleSecure)
+   {  do_secureTransLight(ON);
+	   wr = wiegand_PIN_result(&PIN);
+	   if (wr == WIEGAND_OK)
+	   {  if (PIN == securePIN)
+	   //{  if (PIN == 2321)
+	      {  // PIN matches securePIN
+	         printf(" Got PIN %d\n", PIN);
+	         gotPinRead = TRUE;
+	      }
+	   }
+   } else do_secureTransLight(OFF);
+
+   // what to do
+   if (gotCardRead)
+   {
+      if (isMyStation(transStation))
+      {  // we're busy so ignore card read
+         gotCardRead=FALSE;
+         // if there is a returning transaction from me
+         // then may be due to an auto or manual return
+         // therefore clear the handling of secure transactions
+         if (systemDirection == DIR_RETURN) handleSecure=FALSE;
+      }
+      else
+      {  // no active transaction, so what next
+         // 3 choices
+         //   Card check not enabled
+         //   Card check enabled and card found
+         //   Card check enabled and card not found
+         // Choice 1 & 2
+         if ((param.cardCheckEnabled == FALSE) || (UID_Search(Uid) >= 0))
+         {  // Either card check not enabled or is enabled and card found
+	         if (handleSecure)
+	         {  // we need to deal with secure, did we get a pin also
+	            if (gotPinRead)
+	            {  // Got a valid PIN number on a secure transaction
+	               unlockDoor();   // Unlatch door
+	               // Return card number to host (in return inputs x2)
+	               // Reset operations
+	               handleSecure=FALSE;
+	               gotPinRead=FALSE;
+	               gotCardRead=FALSE;
+	               //secureCard.id = cardID_lb;
+	               memcpy(secureCard.id, Uid, sizeof(Uid));
+	               secureCard.time = SEC_TIMER - arrivalTime;
+	            }
+	         }
+	         else
+	         {  // not doing anything else so just open door
+	            unlockDoor();
+	            gotCardRead=FALSE;
+	            // need to send non-secure card reads as well
+	            memcpy(stdCard.id, Uid, sizeof(Uid));
+	            stdCard.time = SEC_TIMER;
+
+	         }
+         } else
+         {  // Choice 3 card check enabled and card not found
+            // don't unlock door, but do send card data to host
+            gotCardRead=FALSE;
+            memcpy(unauthCard.id, Uid, sizeof(Uid));
+            unauthCard.time = SEC_TIMER;
+         }
+      }
+   }
+
+}
 /********************************************************/
 void process_command(struct iomessage message)
-{
+{  // from RS485 bus
    char wcmd, wdata;
    char ok;
    char i;
-   char station;
-   char * sid;
-char UID[15];
+   char *sid;
+   char scanType;
    //static char system_state, new_state;
    static char new_state;
    struct iomessage response;
-	struct UDPmessageType UDPmessage;
    static unsigned long lastSecureRemoveMsg;
-   unsigned long starting;
+
+	char UID[15];
+   char bUID[7];
 
    #GLOBAL_INIT
    {
@@ -960,7 +959,6 @@ char UID[15];
       lastSecureRemoveMsg=0;
    }
 
-   starting=MS_TIMER;
    response.command=0;
    response.station=message.station;   // set initial default
    /* determine what type of command */
@@ -969,28 +967,25 @@ char UID[15];
 		case UID_ADD:
       case UID_DEL:
          // works for both
-         UDPmessage.command = message.command;
-         UDPmessage.station = 0;
-         UDPmessage.data[0] = message.data[0];  // uid byte 0
-         UDPmessage.data[1] = message.data[1];
-         UDPmessage.data[2] = message.data[2];
-         UDPmessage.data[3] = message.data[3];
-         UDPmessage.data[4] = message.data[4];  // uid byte 5
-		   sendUDPcommand(UDPmessage); // ignore return value, will send again periodically
-         UID_Decode(UDPmessage.data, UID);
-         printf("%s UID %s in %ld\n", (message.command == UID_ADD) ? "ADD" : "DEL", UID, MS_TIMER-starting);
+      	for (i=0; i<UIDLen; i++) bUID[i] = message.data[i];
+         UID_Decode(bUID, UID);
+         if (message.command == UID_ADD) UID_Add(UID);
+         else if (bUID[0]=='d') UID_Del("ALL"); // clear whole list
+         	  else UID_Del(UID);             // delete just this one
+         UID[14]=0; // null term for printf
+         printf("%s UID %s\n", (message.command == UID_ADD) ? "ADD" : "DEL", UID);
+
       	break;
 
       case ARE_YOU_READY:
 // debug to see what may be causing loss of communication
 //lastcommand=message.command;
          // enable arrival interrupt / latch
-         // Delay arrivalEnable some seconds to avoid early termination signal (v419)
-         ////if (param.opMode == STD_REMOTE) arrivalEnable(TRUE);  // don't enable interrupt for head diverter
-         if (param.opMode == STD_REMOTE) arrivalEnableDelay = MS_TIMER;
+         if (param.opMode == STD_REMOTE) arrivalEnable(TRUE);  // don't enable interrupt for head diverter
          response.command=ARE_YOU_READY;
          // assume ready for now
-         response.data[0]=1<<(THIS_DEVICE-1);
+//#warnt "NEED TO FIX LOGIC OF HANDLING DEVICE > 7"
+         response.data[0]=THIS_DEVICE_b;   // CONSIDER TO SEND DECIMAL NUMBER AND LET HOST ASSEMBLE THE COLLECTIVE RESPONSE
          transStation=message.station;
          systemDirection=message.data[0];
          mainStation=message.data[1];  // get the main station to be used
@@ -1023,64 +1018,49 @@ char UID[15];
       case SET_DIVERTER:
 // debug to see what may be causing loss of communication
 //lastcommand=message.command;
-			switch (param.opMode)
-         {
-	         case STD_REMOTE:
-	            // stuff for standard remote
-	            if (param.subStaAddressing && message.data[1]==SLAVE)
-	               inUse2(FLASH, station2bit(message.station));
-	            else
-	               inUse(FLASH, station2bit(message.station));
-	            setDiverter(message.station);
-	            break;
-	         case HEAD_DIVERTER:
-	            // stuff for standard head diverter
-	            setDiverter(message.data[0]);  // head diverter comes in different byte
-	            break;
-	         case HEAD_DIVERTER2:
-	            // alternate head diverter
-	            // main on port 1, station 1 on port 2, station 2 on port 3
-	            if (message.data[0]==1) // align to main on port 1
-	               setDiverter(0);  // align main
-	            else
-	               setDiverter(message.station); // align to station
-	            break;
+
+         if (param.opMode == STD_REMOTE)
+         {  // stuff for standard remote
+            if (param.subStaAddressing && message.data[1]==SLAVE)
+               inUse2(FLASH, station2bit(message.station));
+            else
+	            inUse(FLASH, station2bit(message.station));
+#ifdef USE_DIVERTER
+            setDiverter(message.station);
+#endif
+         } else
+         {  // stuff for head diverter
+#ifdef USE_DIVERTER
+            setDiverter(message.data[0]);  // head diverter comes in different byte
+#endif
          }
          mainStation=message.data[1];  // get the main station to be used
          param.subStaAddressing=message.data[2];
          param.blowerType = message.data[3];
          transFlags = message.data[4];    // transaction flags such as STAT & Secure
-
+			if (transFlags & FLAG_SECURE) handleSecure = TRUE;
          break;
 
-      case DIVERTER_STATUS:      /* return logic of correct position */
+
+      case DIVERTER_STATUS:      // return logic of correct position
 // debug to see what may be causing loss of communication
 //lastcommand=message.command;
 			// capture the securePIN
-         securePIN_hb = message.data[2];
-         securePIN_lb = message.data[3];
+         if (isMyStation(message.station)) securePIN = (message.data[2]<<8) + message.data[3];
          // return response
          response.command=DIVERTER_STATUS;
          // which port dependent on opMode
-			switch (param.opMode)
-         {
-	         case STD_REMOTE:
-	            i = message.station;
-	            break;
-	         case HEAD_DIVERTER:
-         		i = message.data[0];				// main, remote, or slave
-	            break;
-	         case HEAD_DIVERTER2:
-	            if (message.data[0]==1) i=0;  // main
-	            else i = message.station;     // sub station for alternate config
-            	break;
-         }
+         if (param.opMode == STD_REMOTE) i = message.station;
+         else i = message.data[0];
          // is that port aligned? or not used?
+			response.data[0]=THIS_DEVICE_b; // DIVERTER_READY;
+/*
          if ( (di_diverterPos == diverter_map[i]) || (diverter_map[i] == 0) )
          {  response.data[0]=1<<(THIS_DEVICE-1); // DIVERTER_READY;
          } else
          { response.data[0]=0;            // DIVERTER_NOT_READY;
          }
+*/
          break;
 
       case RETURN_INPUTS:        /* return general status */
@@ -1093,32 +1073,50 @@ char UID[15];
 
          // tell main how I am doing
          response.command=INPUTS_ARE;
-         response.station=activeStations; // MY_STATIONS;  // return this to enlighten main
+         response.station=MY_STATIONS;  // return this to enlighten main
 
          // fill in the rest of the response based on who I am
          if (param.opMode == STD_REMOTE)
          {  // stuff for standard remote
-            // are there any Secure Card ID's to pass along?
-            station = nextSecureStation();
-				if (station && ((MS_TIMER - lastSecureRemoveMsg)>500))
+            // is there a Secure Card or Std Card ID to pass along?
+
+
+				// determine if there is a secure or standard card swipe
+	         sid = secureCard.id;   // maybe nothing maybe something
+	         if (UID_Not_Zero(secureCard.id))
+	         {  //sid = secureCard.id; already set
+	            scanType = 1; // secure ID
+	         }
+	         else if (UID_Not_Zero(stdCard.id))
+	         {  sid = stdCard.id;
+	            scanType = 2; // standard ID
+				}
+            else if (UID_Not_Zero(unauthCard.id))
+            {  sid = unauthCard.id;
+            	scanType = 3; // unauthorized ID
+            }
+
+				if (UID_Not_Zero(sid) && ((MS_TIMER - lastSecureRemoveMsg)>500))
             {  // instead of INPUTS_ARE need to send SECURE_REMOVAL
                lastSecureRemoveMsg = MS_TIMER;
 		         response.command=SECURE_REMOVAL;
-               response.station=station;
-				   sid = &secureCard[station].id[0];
 	            response.data[0] = *sid++; // secureCardID byte 3
 	            response.data[1] = *sid++; // secureCardID byte 2
 	            response.data[2] = *sid++; // secureCardID byte 1
 	            response.data[3] = *sid++; // secureCardID byte 0
-               //response.data[4] = secureCard[station].time;
-               response.data[4] = *sid++;  // time is now calculated by main
-               response.data[5] = secureCard[station].scanType;
+               //response.data[4] = (char) (secureCard.time/6);  // 6 second resolution
+               response.data[4] = *sid++; // 5 bytes and time is calculated
+               response.data[5] = scanType; // scan type Secure or Std
             } else
 				{
 	            // Return latched carrier arrival if state is wait_for_remote_arrival
-	            //if (latchCarrierArrival && system_state==WAIT_FOR_REM_ARRIVE) ok=TRUE;
-	            //else ok=FALSE;
-	            // Return the arrival signal directly
+	            if (latchCarrierArrival && system_state==WAIT_FOR_REM_ARRIVE)
+	            {  ok=TRUE;
+	               gotPinRead=FALSE;  // Reset any PIN and card reads
+	               gotCardRead=FALSE;
+	            }
+	            else ok=FALSE;
+	            // Return the arrival signal
 	            response.data[REMOTE_ARRIVE]=carrierArrival(MY_STATIONS);
 	            // but if it is none then send latched arrival under some conditions
 	            if ((response.data[REMOTE_ARRIVE]==0) && (latchCarrierArrival)
@@ -1133,23 +1131,32 @@ char UID[15];
 	         // Return latched carrier arrival if state is wait_for_turnaround
 	         if ((latchCarrierArrival || di_HDArrival) && (system_state==WAIT_FOR_TURNAROUND)) ok=TRUE;
 	         else ok=FALSE;
-            // Return the arrival signal, latched in process or steady state
-            if (ok || di_HDArrival) response.data[REMOTE_ARRIVE]=MY_STATIONS;
+            // Return the arrival signal
+            if (ok) response.data[REMOTE_ARRIVE]=MY_STATIONS;
             else response.data[REMOTE_ARRIVE]=0;
             response.data[REMOTE_CIC]=0;
             response.data[REMOTE_DOOR]=0; // HD has no stations  MY_STATIONS;
             response.data[REMOTE_RTS]=0;
+#ifdef USE_BLOWER
             if (blwrError==FALSE) response.data[REMOTE_RTS2]=blowerPosition();
             else response.data[REMOTE_RTS2]=0xFF; // Blower has an error
+#else
+				response.data[REMOTE_RTS2]=0; // No blower here
+#endif
          }
          break;
 
 		case ACK_SECURE_REMOVAL:
          // Acknowledge of secure card id from station n
-			// secureAckStation = message.station
+			//if (isMyStation(message.station))
          // message.data[0] contains bit-wise stations to acknowledge
-         for (station=1; station<=NUM_STATIONS; station++)
-            if (message.data[0] & (station2bit(station))) UID_Clear(secureCard[station].id);
+         if (message.data[0] & THIS_DEVICE_b)
+         {
+         	UID_Clear(secureCard.id);
+				UID_Clear(stdCard.id);
+				UID_Clear(unauthCard.id);
+         }
+
       	break;
 
       case RETURN_EXTENDED:     /* return extended data */
@@ -1159,7 +1166,7 @@ char UID[15];
          response.command=RETURN_EXTENDED;
          response.data[0]=0;//watchdogCount();
          response.data[1]=0;//powerlowCount();
-         response.data[2]=VERSION;
+         response.data[2]=SUBVERSION;
          break;
 
       case SET_OUTPUTS:
@@ -1189,7 +1196,6 @@ char UID[15];
       	param.blowerType = message.data[1];
 			writeParameterSettings();
          setDiverterMap(param.portMapping);
-			sendUDPCardParameters();  // also force write of remote parameters
 
       	break;
 
@@ -1198,28 +1204,27 @@ char UID[15];
          {
          case 0:
          	param.cardFormat = message.data[1];
+			   cardReaderInit();
 	      	break;
       	case 1:
-         	param.cardR9Min = *(unsigned long *)&message.data[1];
+///         	param.cardR9Min = *(unsigned long *)&message.data[1];
 	      	break;
          case 2:
-         	param.cardR9Max = *(unsigned long *)&message.data[1];
+///         	param.cardR9Max = *(unsigned long *)&message.data[1];
 	      	break;
          case 3:
-         	param.card2L3Digits = message.data[1];
+///         	param.card2L3Digits = message.data[1];
 	      	break;
       	case 4:
-         	param.card2R9Min = *(unsigned long *)&message.data[1];
+///         	param.card2R9Min = *(unsigned long *)&message.data[1];
 	      	break;
          case 5:
-         	param.card2R9Max = *(unsigned long *)&message.data[1];
+///         	param.card2R9Max = *(unsigned long *)&message.data[1];
+				break;
             // last one so save and send the data to remotes
 				// writeParameterSettings();  SAVE WILL FOLLOW IMMEDIATELY FROM SET_PARAMETERS
-				sendUDPCardParameters();
-	      	break;
-         case 6: // others above probably not used
+         case 6: // others above probably not used except 0
          	param.cardCheckEnabled = message.data[1];
-				sendUDPCardParameters();
 	      	break;
          }
          break;
@@ -1243,19 +1248,12 @@ char UID[15];
 						else  carrier_attn |= station2bit(message.station);  // to flash inuse
                   arrival_alert(aaSET, message.station);
                }
+               arrivalTime=SEC_TIMER;  // used with secureRemovalTime
             }
             else if (message.data[0] == DIR_RETURN && isMyStation(message.station))
             {  // capture the main arrival flag
             }
          } // nothing else for head diverter
-         // pass this along to the remote stations
-         UDPmessage.command = TRANS_COMPLETE;
-         UDPmessage.station = message.station;
-         UDPmessage.data[0] = message.data[0];
-         UDPmessage.data[1] = message.data[1];
-         UDPmessage.data[2] = message.data[2];
-		   sendUDPcommand(UDPmessage); // ignore return value, will send again periodically
-
          break;
 
       case MALFUNCTION:  // may be contributing to funky flashing
@@ -1294,7 +1292,9 @@ char UID[15];
             alarm(OFF);
             arrival_alert(aaRESET, 0);
          }
+#ifdef USE_BLOWER
          blwrError=FALSE;       // reset blower error
+#endif
          arrivalEnable(FALSE);  // Disable arrival interrupt
          /// rts_latch=0;  Try to not clear latch on reset
          transStation=0;
@@ -1310,7 +1310,7 @@ char UID[15];
    /* send the response message if any AND the query was only to me */
    if (response.command && (message.device==THIS_DEVICE))
    {  msDelay(2); // hold off response just a bit
-      //response.lplc=THIS_DEVICE;
+      //response.device=THIS_DEVICE;
       send_response(response);
    }
 
@@ -1318,116 +1318,158 @@ char UID[15];
    if (new_state != system_state)
    {  // set blower for new state
       system_state=new_state;
-      blower(blowerStateTable[system_state][blwrConfig]);
+#ifdef USE_BLOWER
+      blower(blowerStateTable[system_state][0]); // remote always uses blwrconfig 0
+#endif
    }
+
+   // state change to/from malfunction state
+   malfunctionActive = (system_state == MALFUNCTION_STATE);
+   // handle state change of malfunction
+   checkMalfunction();
 
    return;
 }
-void processUDPcommand(struct UDPmessageType UDPmessage)
-{
-#ifdef USE_TCPIP
-	// Handle any incoming UDP packets for me
-   int b_station;
-   static unsigned long print_timer;
-   //unsigned long secureID;
-   static int msg_count;
-   #GLOBAL_INIT { msg_count=0; }
+void checkMalfunction()
+{  // take care of business when malfunction changes state
+	// uses malfunctionActive
+   static char lastMalfunction;   // to keep track of when malfunctionActive changes
 
-   // track and print UDP stats
-   msg_count++;
-  	if (MS_TIMER - print_timer > 1000)
-   {  print_timer=MS_TIMER;
-      printf("\n Got %d messages", msg_count);
-      msg_count=0;
-   	//printf("\n  Got UDP message %c at %ld", UDPmessage.command, UDPmessage.timestamp);
+   if (lastMalfunction != malfunctionActive)
+   {  // malf activated or reset?
+      if (malfunctionActive)
+      {  // malfunction
+         alarm(ON);
+         arrival_alert(aaRESET, 0);
+      } else
+      {  // reset
+         alarm(OFF);
+         #ifdef USE_BLOWER
+            blwrError=FALSE;       // reset blower error
+         #endif
+         arrivalEnable(FALSE);  // Disable arrival interrupt
+         // Resetting of handleSecure may be a problem because it could lead to
+         // the ability to remove a secure substance when the main station resets
+         // handleSecure = FALSE;
+      }
+      lastMalfunction = malfunctionActive;
    }
+
+}
+void processUDPcommand(struct UDPmessageType UDPmessage)
+{   // Handles incoming requests from the diverter controller
+
+	static char lastTransStation;  // to keep track of when transStation changes
+	char UID[15];
+   char bUID[7];
+   int i;
+   static char new_state;
+
+
+  	//printf("\n  Got UDP message %c at %ld, %d, %d, %ld", UDPmessage.command, UDPmessage.timestamp, latchCarrierArrival, arrivalISRstate, arrivalDuration);
    /* determine what type of command */
    switch(UDPmessage.command)
    {
-      case INPUTS_ARE:
-			// place returned values into local variables
-         // Note: need to shift input bit positions according to station number
-         b_station = station2bit(UDPmessage.station);
-         if (UDPmessage.data[0]) g_carrierInChamber |= b_station;   // bit on
-         else                    g_carrierInChamber &= ~b_station;  // bit off
-         if (UDPmessage.data[1]) g_doorClosed |= b_station;   // bit on
-         else                    g_doorClosed &= ~b_station;  // bit off
-         if (UDPmessage.data[2]) g_carrierArrival |= b_station;   // bit on
-         else                    g_carrierArrival &= ~b_station;  // bit off
-         if (UDPmessage.data[3]) g_requestToSend |= b_station;   // bit on
-         else                    g_requestToSend &= ~b_station;  // bit off
-         if (UDPmessage.data[4]) g_requestToSend2 |= b_station;   // bit on
-         else                    g_requestToSend2 &= ~b_station;  // bit off
+   	case UID_ADD:
+      case UID_DEL:
+      	for (i=0; i<UIDLen; i++) bUID[i] = UDPmessage.data[i];
+         UID_Decode(bUID, UID);
+         if (UDPmessage.command == UID_ADD) UID_Add(UID);
+         else if (bUID[0]=='d') UID_Del("ALL"); // clear whole list
+         	  else UID_Del(UID);             // delete just this one
+         UID[14]=0; // null term for printf
+         printf("%s UID %s\n", (UDPmessage.command == UID_ADD) ? "ADD" : "DEL", UID);
+      	break;
 
-         // save version number
-
-         // Secure Card ID starts at .data[9]
-         //secureID = *(unsigned long *)&UDPmessage.data[9];
-         //memcpy(secureID, &UDPmessage.data[9], sizeof(secureID));
-         if (UID_Not_Zero(&UDPmessage.data[9]))
-         {  // non-zero ID to be cached
-	         //secureCard[UDPmessage.station].id = secureID;
-            memcpy(secureCard[UDPmessage.station].id, &UDPmessage.data[9], UIDLen);
-	         secureCard[UDPmessage.station].time = UDPmessage.data[14];
-            secureCard[UDPmessage.station].scanType = UDPmessage.data[8];
-	         // tell remote we got the card ID
-            secureAck = UDPmessage.station;
-//	         if (secureCard[UDPmessage.station].id)
-//	            secureAck = UDPmessage.station;
-//	         else
-//	            secureAck = 0;
+   	case TRANS_COMPLETE:
+         // handle completed transaction
+         arrivalEnable(FALSE);  // Disable arrival interrupt - probably redundant
+         transStation=0;
+         alert(OFF, MY_STATIONS);  // in case it was on??
+         doorAlert(OFF);           // ditto
+         // set arrival alert if the transaction is to here
+         if (UDPmessage.data[0] == DIR_SEND && isMyStation(UDPmessage.station))
+         {  if (UDPmessage.data[1]==1)  // and Main says to set arrival alert
+            { // OK to set alert
+               if ((mainStation==SLAVE) && (param.subStaAddressing==TRUE))
+                     carrier_attn2 = 1; //|= station2bit(UDPmessage.station);  // to flash inuse
+               else  carrier_attn = 1; //|= station2bit(UDPmessage.station);  // to flash inuse
+               arrival_alert(aaSET, 1); //UDPmessage.station);
+            }
+	         gotPinRead=FALSE;  // Reset any PIN and card reads
+	         gotCardRead=FALSE;
+            arrivalTime=SEC_TIMER;  // used with secureRemovalTime
          }
+      	break;
 
-      break;
+      case REMOTE_PAYLOAD:  // standard data distribution message
+         arrival_from = UDPmessage.data[0];
+			new_state = UDPmessage.data[1];
+         transStation = UDPmessage.data[3];
+         mainStation = UDPmessage.data[4];
+         diverterStation = UDPmessage.data[5];
+         param.subStaAddressing = UDPmessage.data[6];
+         transFlags = UDPmessage.data[7];
+         // do we have a secure ack?
+         if (isMyStation(UDPmessage.data[8]))
+         {  UID_Clear(secureCard.id);  // clear secureCardID
+            UID_Clear(stdCard.id);  // and standard card
+				UID_Clear(unauthCard.id);
+         }
+         malfunctionActive = (new_state == MALFUNCTION_STATE);
+         systemDirection = UDPmessage.data[11];
+         purge_mode = UDPmessage.data[12];
+
+         // handle capture of secure transaction
+         if ((transFlags & FLAG_SECURE) && isMyStation(transStation))
+         {  handleSecure = TRUE;
+            securePIN = (UDPmessage.data[9]<<8) + UDPmessage.data[10];
+            UID_Clear(secureCard.id);
+         }
+         // handle reset of secure transaction
+         if ((new_state == CANCEL_STATE) && isMyStation(transStation))
+         {  handleSecure = FALSE;
+         	UID_Clear(secureCard.id);
+            UID_Clear(stdCard.id);
+				UID_Clear(unauthCard.id);
+         }
+         // handle some state changes
+         if (transStation != lastTransStation)
+         {  // is transaction starting or stopping?
+         	if (isMyStation(transStation))
+            {  arrivalEnable(TRUE);  // ready latch
+            }
+         	else arrivalEnable(FALSE);   // clear the latched arrival
+            // reset state change
+            lastTransStation = transStation;
+         }
+         // handle state change of malfunction
+		   checkMalfunction();
+
+      	break;
+
+      case SET_CARD_PARAMS:
+///         param.cardL3Digits = UDPmessage.data[0];
+///         param.cardR9Min = *(unsigned long *)&UDPmessage.data[1];
+///         param.cardR9Max = *(unsigned long *)&UDPmessage.data[5];
+///         param.card2L3Digits = UDPmessage.data[9];
+///         param.card2R9Min = *(unsigned long *)&UDPmessage.data[10];
+///         param.card2R9Max = *(unsigned long *)&UDPmessage.data[14];
+			param.cardCheckEnabled = UDPmessage.data[0];
+         param.cardFormat = UDPmessage.data[1];
+         writeParameterSettings();
+		   cardReaderInit();
+
+      	break;
    }
-   // track the active stations to report when a station stops communicating
-   monitorUDPactivity(UDPmessage.device);
-
-   // do we need to send any UDP packets?
-   // handle them
+      // process state change
+   if (new_state != system_state)
+   {  // set blower for new state
+      system_state=new_state;
+#ifdef USE_BLOWER
+      blower(blowerStateTable[system_state][0]); // always config 0 (standard blower)
 #endif
-}
-void monitorUDPactivity(char deviceID)
-{  // track the active stations to report when a station stops communicating
-   // call with deviceID = 0 to refresh statistics
-#ifdef USE_TCPIP
-	static int recentDevices[NUM_STATIONS+1];
-   static unsigned long refreshTimer;
-   static int idx;
-
-   #GLOBAL_INIT
-   {	for (idx=0; idx<=NUM_STATIONS; idx++) recentDevices[idx]=0;
-      refreshTimer=0;
-      activeStations=0;
-   }
-
-   // make sure this device is within range
-   if (deviceID < 10)
-   {  // capture this device
-	   recentDevices[deviceID]++;
-   }
-   // update and report new statistic every 1 secon
-   if (MS_TIMER - refreshTimer >1000)
-   {  // report the new statistic
-      refreshTimer = MS_TIMER;
-      activeStations = 0;
-      for (idx=NUM_STATIONS; idx>0; idx--)  // count down
-      {  activeStations = (activeStations << 1);            // shift
-      	activeStations |= (recentDevices[idx]>0) ? 1 : 0;  // include bit
-		   // clear the history buffer
-		   recentDevices[idx]=0;
-      }
-   }
-#endif
-}
-
-char nextSecureStation(void)
-{  // if a secureCardID is in the buffer return the station number
-	char i;
-   for (i=1; i<9; i++)
-   	if (UID_Not_Zero(secureCard[i].id)) return i;
-
-   return 0;
+	}
 }
 
 unsigned long alert_timer[8];   // for stations 1..7     ...  [0] is not used.
@@ -1466,13 +1508,17 @@ void arrival_alert(char func, char station)
                  alert(OFF, station2bit(i));
              }
              //else if (clock() = alert_timer[i] > 1)
-             else if (!doorClosed( station2bit(i) ) || i==transStation)
+             //else if (!doorClosed( station2bit(i) ) || i==transStation)
+             // will only use station 1 in the alert array but transStation is the real station number
+             else if (!doorClosed( station2bit(i) ) || isMyStation(transStation))
              {  // no carrier, door open
                // or no carrier, in transit --> reset
                alert_timer[i]=0;
                alert(OFF, station2bit(i));
                carrier_attn &= ~station2bit(i); // clear attn flag
                carrier_attn2 &= ~station2bit(i); // clear attn flag
+               // This should only happen with this_station
+               handleSecure = FALSE;
 
              }
           } else
@@ -1577,8 +1623,8 @@ void set_remote_io(char *remotedata)
    remoteoutput[1]=remotedata[1];
 //   remoteoutput[2]=remotedata[2];  // THIS IS devAlert - DON'T TAKE FROM MAIN
    remoteoutput[2]=remotedata[2];   // Instead use remotedata[2] to drive the door alert
-//   remoteoutput[3]=remotedata[3];
-   purge_mode=remotedata[3];
+   remoteoutput[3]=remotedata[3];
+
    /* write out all outputs .. some may need to be shifted */
 //   write4data(addrIUS, outputvalue[devIUS] | remoteoutput[devIUS]);
 //   write4data(addrIUF, outputvalue[devIUF] | remoteoutput[devIUF]);
@@ -1594,54 +1640,30 @@ void set_remote_io(char *remotedata)
 }
 /******************************************************************/
 char carrierInChamber(char stamask)
-{
-#if REMOTE_TYPE == RT_DIVERTERONLY
-  return (g_carrierInChamber) & stamask;
-#else
-  return (di_carrierInChamber << IO_SHIFT) & stamask;
-#endif
-}
+{  return (di_carrierInChamber << IO_SHIFT) & stamask; }
 /******************************************************************/
 char doorClosed(char stamask)
 {  // Note: input is normally high on closed.
    char indata;
-#if REMOTE_TYPE == RT_DIVERTERONLY
-   return (g_doorClosed & stamask);
-#else
    indata = di_doorClosed;
    return ((indata << IO_SHIFT) & stamask);
-#endif
 }
 /******************************************************************/
 char carrierArrival(char stamask)
-{
-#if REMOTE_TYPE == RT_DIVERTERONLY
-	return g_carrierArrival & stamask;
-#else
-	return (di_carrierArrival << IO_SHIFT) & stamask;
-#endif
-}
+{  return (di_carrierArrival << IO_SHIFT) & stamask; }
 
 /******************************************************************/
 char requestToSend(char stamask)
 {
    char indata;
-#if REMOTE_TYPE == RT_DIVERTERONLY
-   return (g_requestToSend & stamask);
-#else
    indata = di_requestToSend;
    return ((indata << IO_SHIFT) & stamask);
-#endif
 }
 char requestToSend2(char stamask)
 {
    char indata;
-#if REMOTE_TYPE == RT_DIVERTERONLY
-   return (g_requestToSend2 & stamask);
-#else
    indata = di_requestToSend2;
    return ((indata << IO_SHIFT) & stamask);
-#endif
 }
 /******************************************************************/
 void inUse(char how, char station_b)
@@ -1688,6 +1710,19 @@ void inUse2(char how, char station_b)
 
    return;
 }
+void doorAlert(char how)
+{  // still using remoteoutput[devAlert] because thats how it was handled before
+	remoteoutput[devAlert] = how;
+	return;
+}
+
+unsigned long doorUnLockTimer;
+void unlockDoor(void)
+{  // trigger door output timer
+	#GLOBAL_INIT {doorUnLockTimer=0;}
+	doorUnLockTimer = MS_TIMER;
+   do_doorUnLock(ON);
+}
 /******************************************************************/
 void alert(char how, char station_b)
 {
@@ -1704,59 +1739,61 @@ void alert(char how, char station_b)
 /******************************************************************/
 void alarm(char how)
 {
-   // outputvalue is checked in the inUse function to turn alarm on/off
+   // outputvalue is checked in the maintenance function to turn alarm on/off
    outputvalue[devAlarm] = how;
 
    return;
 }
 /******************************************************************/
-unsigned long diverter_start_time;     // these used primarily by diverter functions
-char diverter_setting;
-char diverter_attention;
-void setDiverter(char station)
-{  /* Controls the setting of diverter positions
-      Return from this routine is immediate.  If diverter is not
-      in position, it is turned on and a timer started.
+#ifdef USE_DIVERTER
+	unsigned long diverter_start_time;     // these used primarily by diverter functions
+	char diverter_setting;
+	char diverter_attention;
+	void setDiverter(char station)
+	{  /* Controls the setting of diverter positions
+	      Return from this routine is immediate.  If diverter is not
+	      in position, it is turned on and a timer started.
 
-      You MUST repeatedly call processDiverter() to complete processing
-      of the diverter control position
-   */
+	      You MUST repeatedly call processDiverter() to complete processing
+	      of the diverter control position
+	   */
 
-   /* use mapping from station to diverter position */
+	   /* use mapping from station to diverter position */
 
-   if ((station>=0) && (station<9))     // Valid station #
-   {
-      diverter_setting = diverter_map[station];    // mapped setting
+	   if ((station>0) && (station<9))     // Valid station #
+	   {
+	      diverter_setting = diverter_map[station];    // mapped setting
 
-      // if position<>ANY (any=0) and not in position
-      if ((diverter_setting>0) && (diverter_setting!=di_diverterPos))
-      {
-         /* turn on diverter and start timer */
-         do_diverter(ON);
+	      // if position<>ANY (any=0) and not in position
+	      if ((diverter_setting>0) && (diverter_setting!=di_diverterPos))
+	      {
+	         /* turn on diverter and start timer */
+	         do_diverter(ON);
 
-         diverter_start_time = MS_TIMER;
-         diverter_attention = TRUE;
-         diverterStation=station;
-      }
-   }
-   return;
-}
-/******************************************************************/
-void processDiverter()
-{  /* Poll type processing of diverter control system */
-   /* Allows other processes to be acknowleged when setting diverter */
+	         diverter_start_time = MS_TIMER;
+	         diverter_attention = TRUE;
+	         diverterStation=station;
+	      }
+	   }
+	   return;
+	}
+	/******************************************************************/
+	void processDiverter()
+	{  /* Poll type processing of diverter control system */
+	   /* Allows other processes to be acknowleged when setting diverter */
 
-   if (diverter_attention)
-   {
-      if ((diverter_setting == di_diverterPos) || Timeout(diverter_start_time, DIVERTER_TIMEOUT))
-      {
-         // turn off diverter and clear status
-         do_diverter(OFF);
-         diverter_attention = FALSE;
-         diverterStation=0;
-      }
-   }
-}
+	   if (diverter_attention)
+	   {
+	      if ((diverter_setting == di_diverterPos) || Timeout(diverter_start_time, DIVERTER_TIMEOUT))
+	      {
+	         // turn off diverter and clear status
+	         do_diverter(OFF);
+	         diverter_attention = FALSE;
+	         diverterStation=0;
+	      }
+	   }
+	}
+#endif
 void showactivity()
 {
    // update active processor signal
@@ -1778,12 +1815,115 @@ void toggleLED(char LEDDev)
       ledOut(LEDDev, LEDState[LEDDev]);    // send LED state
    }
 }
+#ifdef USE_TCPIP
+int getUDPcommand(struct UDPmessageType *UDPmessage)
+{
+	// be sure to allocate enough space in buffer to handle possible incoming messages (up to 128 bytes for now)
+   auto char   buf[128];
+   auto int    length, retval;
+   int idx;
+   char * UDPbuffer;  // to index into UDPmessage byte by byte
 
+   length = sizeof(buf);
+   retval = udp_recv(&sock, buf, length);
+   if (retval < -1) {
+      printf("Error %d receiving datagram!  Closing and reopening socket...\n", retval);
+      sock_close(&sock);
+      if(!udp_open(&sock, LOCAL_PORT, -1/*resolve(REMOTE_IP)*/, REMOTE_PORT, NULL)) {
+         printf("udp_open failed!\n");
+      }
+   }
+   else
+   {  // Is there any message
+   	if (retval >1)
+	   {  // is the command for me?
+	      // map it into the UDPmessage structure
+	      UDPbuffer = (char *) UDPmessage;
+	      for (idx = 0; idx < sizeof(*UDPmessage); idx++)
+	         UDPbuffer[idx] = buf[idx];
+	      // Return it
+      }
+	}
+   return retval;
+}
+int sendUDPcommand(struct UDPmessageType UDPmessage)
+{
+	// Send the supplied command over UDP
+   // Appends some info to the standard message
+   //   .device
+   //   .timestamp
+
+   auto int    length, retval;
+   char * UDPbuffer;  // to index into UDPmessage byte by byte
+
+   // fill the packet with additional data
+   UDPmessage.device = THIS_DEVICE;  // system id
+   UDPmessage.devType = 3; // remote
+   UDPmessage.timestamp = MS_TIMER;
+
+   length = sizeof(UDPmessage); // how many bytes to send
+   UDPbuffer = (char *) &UDPmessage;
+
+   /* send the packet */
+   retval = udp_send(&sock, UDPbuffer, length);
+   if (retval < 0) {
+      printf("Error sending datagram!  Closing and reopening socket...\n");
+      sock_close(&sock);
+      if(!udp_open(&sock, LOCAL_PORT, -1/*resolve(REMOTE_IP)*/, REMOTE_PORT, NULL)) {
+         printf("udp_open failed!\n");
+      }
+   }
+}
+int sendUDPHeartbeat(char sample)
+{  // Sends an INPUTS_ARE message to the host
+
+	struct UDPmessageType HBmessage;
+   char * sid;
+
+   HBmessage.command = INPUTS_ARE;
+   HBmessage.station = THIS_DEVICE;  // provide the real station number
+   HBmessage.data[0] = carrierInChamber(MY_STATIONS); // CIC
+   HBmessage.data[1] = doorClosed(MY_STATIONS); // Door closed
+   HBmessage.data[2] = carrierArrival(MY_STATIONS); // Arrival
+   // but if Arrival is none then send latched arrival under some conditions
+   if ((HBmessage.data[2]==0) && (latchCarrierArrival) && (system_state==WAIT_FOR_REM_ARRIVE))
+	   HBmessage.data[2] = latchCarrierArrival; // Arrival
+   HBmessage.data[3] = rts_latch;  // RTS latch
+   HBmessage.data[4] = rts2_latch; // RTS latch - 2nd destination
+   HBmessage.data[5] = VERSION; // Version
+   HBmessage.data[6] = SUBVERSION; // Sub-version
+   HBmessage.data[7] = 0; // nothing
+   HBmessage.data[8] = 0; // nothing initialize
+   sid = secureCard.id;   // maybe nothing maybe something
+   if (UID_Not_Zero(secureCard.id))
+   {  //sid = secureCard.id; already set
+		HBmessage.data[8] = 1; // secure ID
+	   HBmessage.data[14] = (char) (secureCard.time/6);
+   }
+   else if (UID_Not_Zero(stdCard.id))
+   {  sid = stdCard.id;
+		HBmessage.data[8] = 2; // standard ID
+	   HBmessage.data[14] = 0; // no timing
+   }
+   else if (UID_Not_Zero(unauthCard.id))
+   {  sid = unauthCard.id;
+		HBmessage.data[8] = 3; // unauthorized ID
+	   HBmessage.data[14] = 0; // no timing
+   }
+   HBmessage.data[9] = *sid++; // secureCardID[0]
+   HBmessage.data[10] = *sid++; // secureCardID[1]
+   HBmessage.data[11] = *sid++; // secureCardID[2]
+   HBmessage.data[12] = *sid++; // secureCardID[3]
+   HBmessage.data[13] = *sid++; // secureCardID[4]
+   sendUDPcommand(HBmessage); // ignore return value, will send again periodically
+
+}
+#endif
 void maintenance(void)
 {  // handle all regularly scheduled calls
 	// use of static CHAR was causing PA4 RS485 transmitter to enable without reason ... static INT works ok.
-   static int out_alert, out_inuse, out_inuse2, out_doorAlert;
-   char i, cic_data, pflash;
+   static int out_alert, out_inuse, out_inuse2, out_doorAlert, out_cic;
+   char i;
 
    hitwd();                // hit the watchdog timer
    showactivity();
@@ -1811,372 +1951,39 @@ void maintenance(void)
    	out_inuse2 = outputvalue[dev2IUS] >> IO_SHIFT;
    }
 
-   // get carrier in chamber data
-   cic_data=carrierInChamber(MY_STATIONS) >> IO_SHIFT;
+   // handle carrier in chamber light
+   // Need to shift CIC input back to (1..4) range for correct output
+   out_cic = carrierInChamber(MY_STATIONS)>>IO_SHIFT;
 
-   // if purge mode handle lights different
-   if (purge_mode==1)
-   {
-      if ((MS_TIMER%300) < 150)
-      {  out_inuse=0;
-         out_inuse2=0;
-         cic_data=MY_STATIONS >> IO_SHIFT;
+   // Process alarm output or purge mode flashing
+   if (outputvalue[devAlarm] || purge_mode==1)
+   {  // override use of inuse and carrier-in-chamber
+   	if ((MS_TIMER %300) < 150)
+      {  out_inuse=MY_STATIONS;
+      	out_inuse2=MY_STATIONS;
+         out_cic=0;
       } else
-      {  out_inuse=MY_STATIONS >> IO_SHIFT;
-   		out_inuse2=MY_STATIONS >> IO_SHIFT;
-         cic_data=0;
+      {  out_inuse=0;
+      	out_inuse2=0;
+         out_cic=MY_STATIONS;
       }
    }
 
-   // Write out alerts and inUse light and CIC
-   // Check for and setup point to point configuration
-   #if REMOTE_TYPE == RT_POINT2POINT
-	   do_arrivalAlert(0, out_alert & 1);
-	   do_doorAlert(0, out_doorAlert & 1);
-		do_inUseLight(0, out_inuse & 1);
-		do_CICLight(0, cic_data & 1);
-   #endif
-	#if REMOTE_TYPE == RT_STANDARD
-	   for (i=0; i<4; i++)
-	   {  do_arrivalAlert(i, out_alert & (1<<i));
-	      do_doorAlert(i, out_doorAlert & (1<<i));
-	      do_inUseLight(i, out_inuse & (1<<i));
-	      do_inUse2Light(i, out_inuse2 & (1<<i));
-         do_CICLight(i, cic_data & (1<<i));
-	   }
-   #endif
+   // Write out alerts and inUse light
+   do_arrivalAlert(0, out_alert & 1);
+   do_inUseLight(0, out_inuse & 1);
+   // do_inUseLight2(0, out_inuse2 & 1); output reassigned v417 and later
+   do_doorAlert(0, out_doorAlert & 1);
+   do_CICLight(0, out_cic & 1);
 
-
-   // Process alarm output
-   //do_alarm(outputvalue[devAlarm]);
-
-}
-
-/******************************************************************/
-// Blower Processing Routines - supports both standard and APU blowers
-/******************************************************************/
-// Interface definition
-// char blwrConfig;     // to become a parameter from eeprom
-// blwrConfig 0 = Standard blower
-// blwrConfig 1 = High capacity APU blower
-// #define blwrOFF  0
-// #define blwrIDLE 1
-// #define blwrVAC  2
-// #define blwrPRS  3
-// void initBlower(void);
-// void blower(char blowerOperatingValue);  // use blwrOFF, blwrIDLE, blwrVAC, blwrPRS
-// char processBlower(void);
-// char blowerPosition(void);
-/*
-char blower_mode, blower_limbo, last_shifter_pos, lastDir;
-unsigned long blower_timer;
-
-void initBlower()
-{   // trys to find any shifter position, then goes to idle
-    unsigned long mytimer;
-
-    blwrConfig = 1; // Turnaround configuration
-
-    // Clear global blower variables
-    last_shifter_pos=0;
-    lastDir=0;
-    blower_limbo=FALSE;
-	 blwrError=FALSE;
-
-    // turn off all outputs
-    do_blower(OFF);
-    do_blowerVac(OFF);
-    do_blowerPrs(OFF);
-
-    // remainder of initialization is for APU blowers only
-    if (param.blowerType == blwrType_APU)
-    {
-	    // if not in any position, try to find any position
-	    if (blowerPosition() == 0)
-	    {  // hunt for any position
-	       do_blowerPrs(ON);
-	       mytimer=MS_TIMER;
-	       while (Timeout(mytimer, 5000)==FALSE && blowerPosition()==0) hitwd();
-	       if (blowerPosition()==0)
-	       {  // still not found...so go the other way
-	          do_blowerPrs(OFF);
-	          do_blowerVac(ON);
-	          mytimer=MS_TIMER;
-	          while (Timeout(mytimer, 5000)==FALSE && blowerPosition()==0) hitwd();
-	          do_blowerVac(OFF);
-             if (blowerPosition()==0) blwrError = TRUE;  // capture unknown position error
-	       }
-	    }
-
-	    // after all that, now command to goto idle
-	    blower(blwrIDLE);
-	 }
-}
-void blower(char request)
-{  // operates both standard blowers and APU blowers
-   // sets the direction of the blower shifter
-   // use  blwrVAC, blwrPRS, blwrIDLE, or OFF
-   char hv_save;
-   char how;
-   static char lastHow;
-
-   #GLOBAL_INIT
-   {  blwrConfig = 1; // Turnaround configuration
-      lastHow = 0;
-   }
-
-   // Handling of standard blower type
-   if (param.blowerType == blwrType_STD)
-   {  // No such state as idle in standard blowers so map to OFF
-   	if (request==blwrIDLE) request=blwrOFF;
-	   how = request;
-
-	   // make sure correct parameter is used.  anything but VAC and PRS is OFF
-	   if ((how != blwrVAC) && (how != blwrPRS)) how = blwrOFF;
-
-	   // if going from one on-state to the other on-state then turn off first
-	   if ((how != blwrOFF) && (lastHow != blwrOFF) && (how != lastHow))
-	   {  // can't run in both directions at the same time
-	      do_blowerPrs(OFF);
-	      do_blowerVac(OFF);
-	      msDelay(100);                   // wait a little while
-	   }
-
-	   // turn on appropriate bit
-	   if (how == blwrPRS)      do_blowerPrs(ON);
-	   else if (how == blwrVAC) do_blowerVac(ON);
-	   else { do_blowerPrs(OFF);
-	          do_blowerVac(OFF);
-	        }
-	   // Add alternate blower on/off control per Joe request on 10-Jul-07
-   	if (how != blwrOFF) do_blower(ON);
-		else do_blower(OFF);
-
-	   // remember last setting
-	   lastHow = how;
-   } // end of standard blower
-
-   // Handling of APU blower type
-   else if ((param.blowerType == blwrType_APU) && (request != lastHow))
-   {
-	   // store in local work space
-	   blower_mode=request;
-	   blower_limbo=FALSE;
-      lastHow=request;
-
-	   // clear previous state
-	   // hv_save=output_buffer;
-	   // turn off shifters
-	   do_blowerPrs(OFF);
-	   do_blowerVac(OFF);
-
-	   // CW for Pressure to Idle or Any to Vacuum
-	   // CCW for Vacuum to Idle or Any to Pressure
-	   if (blower_mode == blwrVAC) { do_blowerVac(ON); lastDir=blwrVAC; }
-	   else if (blower_mode == blwrPRS) { do_blowerPrs(ON); lastDir=blwrPRS; }
-	   else if (blower_mode == blwrIDLE)
-	   {  if (blowerPosition() == blwrPRS) { do_blowerVac(ON); lastDir=blwrVAC; }
-	      else if (blowerPosition() == blwrVAC) { do_blowerPrs(ON); lastDir=blwrPRS; }
-	      else if (blowerPosition() == 0)
-	      {
-	          // go to idle but don't know which way
-	          if (lastDir==blwrVAC) { do_blowerVac(ON); blower_limbo=TRUE; lastDir=blwrVAC; }
-	          else if (lastDir==blwrPRS) { do_blowerPrs(ON); blower_limbo=TRUE; lastDir=blwrPRS; }
-	          else
-	          {  // use last position to know which way to go
-	             blower_limbo = TRUE;       // incomplete operation
-	             if (last_shifter_pos==blwrPRS) { do_blowerVac(ON); lastDir=blwrVAC; }
-	             else if (last_shifter_pos==blwrVAC) { do_blowerPrs(ON); lastDir=blwrPRS; }
-	             else blower_limbo=FALSE;  // idle to idle is ok to leave alone
-	          }
-	      } // else go-idle and already in idle position
-	   } else if (blower_mode == OFF) do_blower(OFF);  // power off
-
-	   blower_timer = MS_TIMER;
-   }
-
-   return;
-}
-char processBlower()
-{   // call repeatedly to handle process states of the blower
-    // returns non-zero when shifter or blower error
-    char rtnval;
-
-    rtnval=0;  // assume all is good
-
-    // Remainder only for APU blowers
-    if (param.blowerType == blwrType_APU)
-    {
-
-	    if (blower_mode==OFF) return rtnval;  // nothing happening, go home.
-	    if (blower_mode==ON) return rtnval;   // running ... nothing to do
-
-	    // check for idled blower timeout
-	    if ((blower_mode==blwrIDLE) && (last_shifter_pos == blwrIDLE) && (lastDir==0) )
-	    {  // turn off idle'd blower after 2 minutes
-	       if (MS_TIMER - blower_timer > 120000)
-	       {  // turn off all blower outputs
-	          do_blowerPrs(OFF);
-	          do_blowerVac(OFF);
-	          do_blower(OFF);
-	          blower_mode=OFF;
-	          lastDir=0;
-	       }
-	       return rtnval;
-	    }
-
-	    // check for incomplete change of direction and reset shifter outputs.
-	    // if was in limbo, and now in a known position, reset shifter
-	    if (blowerPosition() && blower_limbo) blower(blower_mode);
-
-	    // if in position  .. but only the first time FIX.
-	    if (blower_mode == blowerPosition())
-	    {  // turn off shifter, turn on blower
-	       do_blowerPrs(OFF);
-	       do_blowerVac(OFF);
-	       lastDir=0;
-
-	        // if going for idle position, mode is not ON ... just idle
-	        if (blower_mode != blwrIDLE)
-	        {  blower_mode = ON;          // generic ON state
-	           do_blower(ON);
-	        }
-	        blower_timer=MS_TIMER;  // use also for blower idle time
-	    }
-	    else if (MS_TIMER - blower_timer > 12000)
-	    {  // timeout ... shut off all outputs
-	       do_blowerPrs(OFF);
-	       do_blowerVac(OFF);
-	       lastDir=0;
-	       blower_mode=OFF;
-	       rtnval=1;          // set error code
-          blwrError=TRUE;
-	    }
-    }
-
-    return rtnval;
-
-}
-char blowerPosition()
-{  // returns the current position of the blower shifter
-   // also keeps track of the last valid shifter position
-   char rtnval, inval;
-   rtnval=0;
-   if (di_shifterPosVac) rtnval=blwrVAC;
-   if (di_shifterPosPrs) rtnval=blwrPRS;
-   if (di_shifterPosIdle) rtnval=blwrIDLE;
-   if (rtnval) last_shifter_pos=rtnval;
-   return rtnval;
-}
-/*
-
-/********************************************************
-   IP Communication drivers
-*********************************************************/
-int getUDPcommand(struct UDPmessageType *UDPmessage)
-{
-#ifdef USE_TCPIP
-	// be sure to allocate enough space in buffer to handle possible incoming messages (up to 128 bytes for now)
-   auto char   buf[128];
-   auto int    length, retval;
-   int idx;
-   char * UDPbuffer;  // to index into UDPmessage byte by byte
-
-   length = sizeof(buf);
-   retval = udp_recv(&sock, buf, length);
-   if (retval < -1) {
-      printf("Error %d receiving datagram!  Closing and reopening socket...\n", retval);
-      sock_close(&sock);
-      if(!udp_open(&sock, LOCAL_PORT, -1/*resolve(REMOTE_IP)*/, REMOTE_PORT, NULL)) {
-         printf("udp_open failed!\n");
-      }
-   }
-   else
-   {
-   	// is the command for me?
-		// map it into the UDPmessage structure
-      UDPbuffer = (char *) UDPmessage;
-      for (idx = 0; idx < sizeof(*UDPmessage); idx++)
-      	UDPbuffer[idx] = buf[idx];
-      // Return it
+   // handle door lock reset
+   if (doorUnLockTimer && ((MS_TIMER - doorUnLockTimer) > 2500))
+   {  // Reset door lock
+   	doorUnLockTimer = 0;
+	   do_doorUnLock(OFF);
 	}
-   return retval;
-#endif
 }
-int sendUDPcommand(struct UDPmessageType UDPmessage)
-{
-#ifdef USE_TCPIP
-	// Send the supplied command over UDP
-   // Appends some info to the standard message
-   //   .device
-   //   .timestamp
 
-   auto int length, retval;
-   char * UDPbuffer;  // to index into UDPmessage byte by byte
-
-   // fill the packet with additional data
-   UDPmessage.device = THIS_DEVICE;  // system id
-   UDPmessage.devType = 2; // diverter
-   UDPmessage.timestamp = MS_TIMER;
-
-   length = sizeof(UDPmessage); // how many bytes to send
-   UDPbuffer = (char *) &UDPmessage;
-
-   /* send the packet */
-   retval = udp_send(&sock, UDPbuffer, length);
-   if (retval < 0) {
-      printf("Error sending datagram!  Closing and reopening socket...\n");
-      sock_close(&sock);
-      if(!udp_open(&sock, LOCAL_PORT, -1/*resolve(REMOTE_IP)*/, REMOTE_PORT, NULL)) {
-         printf("udp_open failed!\n");
-      }
-   }
-#endif
-}
-int sendUDPHeartbeat(char sample)
-{  // Sends a periodic message to the remote stations
-#ifdef USE_TCPIP
-	struct UDPmessageType HBmessage;
-
-   HBmessage.command = REMOTE_PAYLOAD;
-   HBmessage.station = MY_STATIONS;
-   HBmessage.data[0] = arrival_from; //
-   HBmessage.data[1] = system_state; //
-   HBmessage.data[2] = 0; // remote alert - not used
-   HBmessage.data[3] = transStation; //
-   HBmessage.data[4] = mainStation; //
-   HBmessage.data[5] = diverterStation; //
-   HBmessage.data[6] = param.subStaAddressing; //
-   HBmessage.data[7] = transFlags; //
-   HBmessage.data[8] = secureAck; // secure ACK
-   secureAck = 0; // clear Ack after sending
-   HBmessage.data[9] = securePIN_hb; // secure PIN high byte
-   HBmessage.data[10] = securePIN_lb; // secure PIN low byte
-   HBmessage.data[11] = systemDirection; // transaction direction
-   HBmessage.data[12] = purge_mode;
-   HBmessage.data[13] = 0; // nothing
-   sendUDPcommand(HBmessage); // ignore return value, will send again periodically
-#endif
-}
-void sendUDPCardParameters(void)
-{
-// Sends secure card parameters the remote stations
-#ifdef USE_TCPIP
-	struct UDPmessageType HBmessage;
-
-   HBmessage.command = SET_CARD_PARAMS;
-   HBmessage.station = MY_STATIONS;
-   //HBmessage.data[0] = param.cardFormat; //
-   *(unsigned long*)&HBmessage.data[1] = param.cardR9Min; //
-   *(unsigned long*)&HBmessage.data[5] = param.cardR9Max; //
-   HBmessage.data[9] = param.card2L3Digits; //
-   *(unsigned long*)&HBmessage.data[10] = param.card2R9Min; //
-   *(unsigned long*)&HBmessage.data[14] = param.card2R9Max; //
-   HBmessage.data[0] = param.cardCheckEnabled; // reuse element 0
-   HBmessage.data[1] = param.cardFormat; // reuse element 1
-   sendUDPcommand(HBmessage); // ignore return value, will send again periodically
-#endif
-}
 
 /********************************************************
    Communication I/O drivers
@@ -2208,7 +2015,7 @@ void enable_commands()
 void send_response(struct iomessage message)
 {  /* Transmits a message/command to the main system.
       Command string defined as:
-      <STX> <device> <Command> <Station> <Data0..5> <ETX> <CHKSUM> */
+      <STX> <device> <Command> <Station> <Data0..3> <ETX> <CHKSUM> */
 
    char i;
    char cmdstr[CMD_LENGTH];
@@ -2284,7 +2091,6 @@ char get_command(struct iomessage *message)
          // set msg_address here since i'm using it next
          msg_address = rbuf[bufstart+1];
          if (msg_address==THIS_DEVICE) ser485Tx();
-//for (i=0; i<CMD_LENGTH-1; i++) printf(" %d", rbuf[bufstart+i]);
 
          /* check checksum */
          chksum=0;
@@ -2331,7 +2137,8 @@ char get_command(struct iomessage *message)
 }
 /******************************************************************/
 char isMyStation(char station)
-{       return (station2bit(station) & MY_STATIONS);
+{  //return (station2bit(station) & MY_STATIONS);
+   return (station2bit(station) & THIS_DEVICE_b);
 }
 /******************************************************************/
 void msDelay(unsigned int delay)
@@ -2402,6 +2209,140 @@ int writeParameterSettings(void)
    int rtn_code;
    rtn_code = writeUserBlock(0, &param, sizeof(param));
    return rtn_code;
+}
+//////////////////////////
+// USER ID FUNCTIONS
+//////////////////////////
+int UID_Add(char *ID)
+{  // add the given 12 byte UID to the list and return the position added (-1 if can't add)
+	// first search to make sure ID doesn't already exist
+   int i;
+   char blank[UIDLen];
+   char enc[UIDLen];
+
+   if (UID_Encode(ID, enc) >= 0)
+	{  // failed to encode
+   	i = UID_Search(enc);
+   	if (i == -1)
+	   {  // not found so add the first blank entry
+	      memset(blank, 0, UIDLen);  // make blank
+	      for (i=0; i<UIDSize; i++)
+	      {  //
+	         if (memcmp(param.UID[i], blank, UIDLen) == 0)
+	         {  // stick it here and return i
+	            memcpy(param.UID[i], enc, UIDLen);
+printf("Adding id %d\n", i);
+	            return i;
+	         }
+	      }
+	      // what? no blanks??
+	   }
+      else
+      {  // already in there so return that index
+         return i;
+      }
+   }
+   return -1;
+
+}
+int UID_Del(char *ID)
+{  // clear out one or all user UID's
+	// ID is the 12 byte representation
+   // return 0 if success, -1 if failed or not found
+
+   char enc[UIDLen];
+	int i;
+
+	if (strncmp(ID,"ALL",3)==0)
+   {  // erase all UID's
+   	for (i=0; i<UIDSize; i++)
+      {	memset(param.UID[i], 0, UIDLen);
+      }
+printf("Deleting All id\n", i);
+      param.UIDSync = 0;  // reset sync timestamp
+      return 0;
+   }
+   else
+   {  if (UID_Encode(ID, enc) >= 0)
+   	{
+	      i = UID_Search(enc);
+	      if (i >= 0)
+         {  memset(param.UID[i], 0, UIDLen);
+printf("Deleting id %d\n", i);
+         	return 0;
+         }
+      }
+   }
+	return -1;
+}
+int UID_Search(char *ID)
+{  // search for the given 5-byte UID and return the position
+	// returns index of match or -1 if no match
+	int i;
+   for (i=0; i<UIDSize; i++)
+   {	if (memcmp(param.UID[i], ID, UIDLen) == 0)
+   	{
+printf("Found id %d\n", i);
+      	return i;
+      }
+   }
+	return -1;
+}
+int UID_Get(int UIndex)
+{  // return the (6 or 12 byte)? UID at position UIndex
+
+}
+unsigned int UID_Cksum()
+{  // calculate checksum of all valid UIDs
+
+}
+int UID_Encode(char *UID, char *Result)
+{  // convert 12 byte string into 5 byte UID
+   // Result must be sized to handle 5 bytes
+   // Return -1 if invalid UID or 0 if success
+
+	int i;
+   int hval;
+   int carry;
+   int uidlen;
+   unsigned long lval;
+   unsigned long llast;
+   unsigned long incr;
+   char hdig[4];  // high 3 digits
+   char ldig[10]; // low 9 digits
+
+   // deal with length of number up to 12 digits
+	uidlen = strlen(UID);
+   if (uidlen < 10)
+   {  // simple math on 4 byte numbers
+   	hval = 0;
+      lval = atol(UID);
+   } else
+   { // split after 9th digit and get decimal equivalents
+	   strncpy(hdig, UID, uidlen-9); hdig[3]=0;
+	   strcpy(ldig, &UID[uidlen-9]);
+	   hval = atoi(hdig);
+   	lval = atol(ldig);
+   }
+
+   // do the math
+   incr = 1000000000;
+   llast = lval;
+   carry=0;
+	for (i=0; i<hval; i++)
+	{  // long math loop
+   	lval = lval + incr;
+      if (lval<llast) carry++;
+      llast = lval;
+	}
+   // transfer back into Result
+   Result[0] = (char)carry;
+	Result[1] = (char)((lval >> 24) & 0xFF) ;
+	Result[2] = (char)((lval >> 16) & 0xFF) ;
+	Result[3] = (char)((lval >> 8) & 0XFF);
+	Result[4] = (char)((lval & 0XFF));
+
+   return 0;
 }
 int UID_Decode(char *UID, char *Result)
 {  // convert 5 byte UID into 12 byte string
