@@ -1935,12 +1935,12 @@ if (MS_TIMER - lastComTimer > 10)
 	      // check slave carrier_return request next
 	      else if (slaveAvailable && slave_rtncarrier && slave_doorClosed) // carrier return function
 	      {  // first check for master to slave
-	         systemStation=bit2station(slave_rts);
+	         systemStation=bit2station(remote_data[REMOTE_RTS]);   // slave_rts);
             translog.flags = FLAG_CRETURN;
             UID_Clear(secureTransLog[systemStation].sid);      // clear secure handling
             secureTransLog[systemStation].start_tm=0;
 	         if (((systemStation==SLAVE) || param.point2point) && di_carrierInChamber)
-	         {  transactionType = TT_MAIN2SLAVE;
+	         {  transactionType = TT_MAIN2REMOTE; // TT_MAIN2SLAVE;
 	         } // otherwise check for carrier return from remote
 	         else if ( (systemStation!=SLAVE) &&
 	               (slave_rts & remote_data[REMOTE_CIC] & remote_data[REMOTE_DOOR]) )
@@ -1950,7 +1950,9 @@ if (MS_TIMER - lastComTimer > 10)
 	      // check slave outbound requests next
 	      else if (slaveAvailable && !statTrans && (slave_rts & STATION_SET) && slave_cic)
 	      {  // slave station outbound to remote
-	         if ( !(remote_data[REMOTE_CIC] & slave_rts & STATION_SET) || param.stacking_ok[1])
+	         // WAS // if ( !(remote_data[REMOTE_CIC] & slave_rts & STATION_SET) || param.stacking_ok[1])
+// WILL NEVER COME HERE slave_rts FORCED TO 0
+	         if ( !(di_carrierInChamber) || param.stacking_ok[0])
 	         {  systemStation=firstBit(slave_rts);
 	            // check for main to main transaction
 	            if (systemStation==SLAVE) { transactionType = TT_SLAVE2MAIN; }
@@ -2005,7 +2007,7 @@ if (MS_TIMER - lastComTimer > 10)
 	         secureTransLog[systemStation].start_tm=0;
             translog.flags = FLAG_ARETURNING;
             if (systemStation==SLAVE)
-            {  transactionType = TT_SLAVE2MAIN;
+            {  transactionType = TT_REMOTE2MAIN; // FORCE TT_SLAVE2MAIN;TT_SLAVE2MAIN;
             } else
             {  transactionType = TT_REMOTE2MAIN;
             }
@@ -2027,8 +2029,9 @@ if (MS_TIMER - lastComTimer > 10)
             	// count how many are hard button versus soft button
 //               if (di_requestToSend) {rtsHardCount++;} else {rtsSoftCount++;}
 	            // check for main to main transaction
-	            if (systemStation==SLAVE) { transactionType = TT_MAIN2SLAVE; }
-	            else							  { transactionType = TT_MAIN2REMOTE; }
+	            //if (systemStation==SLAVE) { transactionType = TT_MAIN2SLAVE; }
+	            //else							  { transactionType = TT_MAIN2REMOTE; }
+               transactionType = TT_MAIN2REMOTE;
                // Set the auto-return flag if requested
 /// why??      if (lcd_autoReturn() || autoRtnTrans) translog.flags = FLAG_ARETURN;
             }
@@ -5468,8 +5471,9 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
 	         //else                    remote_data[REMOTE_ARRIVE] &= ~b_station;  // bit off
             if (UDPmessage.data[2]) slave_arrive=TRUE;
             else                    slave_arrive=FALSE;
-	         if (UDPmessage.data[3]) slave_rts=b_station; //TRUE;   // bit on
-	         else                    slave_rts=FALSE;  // bit off
+	         // DON'T USE //if (UDPmessage.data[3]) slave_rts=b_station; //TRUE;   // bit on
+	         //else                    slave_rts=FALSE;  // bit off
+              slave_rts=0; // FORCE OFF
             slaveReturnStatus = UDPmessage.data[7];
          }
 
