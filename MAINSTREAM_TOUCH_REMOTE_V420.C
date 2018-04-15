@@ -79,6 +79,7 @@
                     Changed lib\wiegand_v2.lib to accept 4-bit pin input
    26-Jan-17   v419 Update mapping of 26 bit to right justify site code w/ card # (one big number)
    05-Nov-17	v420 Mainstream_Touch_Remote first version to support Reach color touchscreen
+   					  Including local logging and station selection by touch-screen
 
 ***************************************************************/
 #memmap xmem  // Required to reduce root memory usage
@@ -117,6 +118,7 @@ int DevRN1100;                   // Rabbit Net Device Number Digital I/O
 
 // setup for Reach color LCD
 #define	LCD_USE_PORTE				// tell Reach library which serial port to use
+//#define REACH_LIB_DEBUG debug
 #use Reach101.lib
 
 // Setup interrupt handling for carrier arrival input
@@ -136,6 +138,68 @@ struct iomessage     /* Communications command structure */
    char station;
    char data[NUMDATA];
 };
+struct stats_type               // transaction summary statistics
+{
+   long trans_in;               // incoming transactions
+   long trans_out;              // outgoing transactions
+   int  deliv_alarm;            // incomplete delivery timeout alarm
+   int  divert_alarm;           // diverter timeout alarm
+   int  cic_lift_alarm;         // carrier lift timeout alarm
+   int  door_alarm;             // door open during transaction
+};
+struct trans_log_type           // transaction logging info
+{
+   unsigned long trans_num;     // transaction number
+   unsigned long start_tm;      // time of departure
+   unsigned int duration;       // duration of event in seconds // time of arrival (or alarm)
+   char  source_sta;            // where it came from
+   char  dest_sta;              // where it went to
+   char  status;                // transaction status (0-63) or other event (64-255)
+   									  // 0 = no malfunction or other transaction status
+                                // 1 = diverter timeout
+                                // 2 = carrier exit (lift) timeout
+                                // 3 = delivery overdue timeout
+                                // 4 = blower timeout
+                                // 5 = station not ready after setting diverter or cancel dispatch
+                                // 6 = transaction cancelled/aborted (future)
+                                // 64 = Door opened event
+   char  flags;                 // transaction flags
+                                // xxxx xxx1 = Stat Transaction
+                                // xxxx xx1x = Carrier return function
+                                // xxxx x1xx = Auto return function
+                                // xxxx 1xxx = Door opened in transaction
+                                // other event flags defined elsewhere
+         // IF TRANSLOG GROWS MAKE SURE UDP COMMAND CAN HOLD IT ALL (NUMUDPDATA)
+};
+// define transaction and event logging status and flags
+#define STS_DIVERTER_TOUT  1
+#define STS_DEPART_TOUT    2
+#define STS_ARRIVE_TOUT    3
+#define STS_BLOWER_TOUT    4
+#define STS_TRANS_CANCEL   5
+#define STS_CANCEL_BY_SEND 6
+#define STS_CANCEL_BY_CIC  7
+#define STS_CANCEL_BY_REMOTE 8
+#define STS_CANCEL_BY_STACK 9
+#define LAST_TRANS_EVENT  31
+#define FLAG_STAT        0x01
+#define FLAG_CRETURN     0x02
+#define FLAG_ARETURN     0x04
+#define FLAG_DOOROPEN    0x08
+#define FLAG_ARETURNING  0x10
+#define FLAG_SECURE      0x20
+// define event logging status and flags
+#define ESTS_DOOROPEN      64
+#define EFLAG_MAINDOOR   0x01
+#define EFLAG_SUBSDOOR   0x02
+#define EFLAG_EXTRA_CIC  0x04
+#define ESTS_MANPURGE      65
+#define ESTS_AUTOPURGE     66
+#define ESTS_SECURE_REMOVAL 32
+#define ESTS_CARD_SCAN     33
+#define ESTS_UNAUTH_CARD   34
+#define ESTS_BLANK        255
+
 #define NUMUDPDATA 18
 struct UDPmessageType  // UDP based messages
 {
@@ -187,7 +251,11 @@ struct par_block_type
    //unsigned long card2R9Max;  // Secure card ID maximum value for the right 9 digits
 	char cardCheckEnabled;  // enable individual card id checking
    char cardFormat;        // defines type of card (26 or 40 bits)
-   char reserved[98];
+   char stationNum;
+   char stationName[12];
+   char mainName[12];
+   char remoteAudibleAlert;
+   char reserved[72];
    unsigned long UIDSync; // timestamp (seconds) since last good block
    char UID[UIDSize][UIDLen];
 } param;
@@ -247,13 +315,49 @@ void unlockDoor(void);
 //void setDiverter(char station);
 //void processDiverter(void);
 void setDiverterMap(char portMap);
+char secTimeout(unsigned long ttime);
+
+// TRANSACTION LOG DEFINITIONS
+void initTransLog(void);
+void addTransaction(struct trans_log_type trans, char xtra);
+//void addSecureTransaction(struct secure_log_type);
+int getTransaction(long entry, struct trans_log_type *trans);
+long findTransaction(unsigned long transNum);
+long sizeOfTransLog(void);
+void checkSerialFlash(void);
+void analyzeEventLog(void);
+struct trans_log_type translog;  // can this be encapsulated?
+unsigned long transactionCount(void);
+void loadTransactionCount(void);
+void resetTransactionCount(unsigned long value);
+void resetStatistics(void);
 
 // TOUCHSCREEN DEFINITIONS
 void lcd_splashScreen(char view);
 void lcd_drawScreen(char whichScreen, char *title);
+char systemStateMsg;
 int lastBkColor;
 void lcd_resetMsgBackColor(void);
 int lcd_Center(char * string, char font);
+char lcd_ShowMenu(char menuLevel, char page);
+int lcd_RefreshScreen(char refresh);
+void lcd_ProcessButtons(void);
+char lcd_SendButton(void);
+int lcd_SelectChoice(char *choice, char *label, char *optZero, char *optOne);
+char lcd_GetNumberEntry(char *description, unsigned long * par_value,
+         unsigned long par_min, unsigned long par_max, char * par_units, char max_digits, char nc_as_ok);
+void lcd_ShowKeypad(char opts);
+void lcd_showPage(long thisPage, long lastPage);
+void lcd_showTransPage(long page, long lastPage, char format);
+void lcd_showTransactions(char format);
+void lcd_showTransSummary(void);
+char lcd_enableAdvancedFeatures(char menu_level, char * description);
+char lcd_getPin(char *PIN, char *description);
+void lcd_enterSetupMode(char operatorLevel);
+char lcd_ProcessMenuItem(char menu_idx, char *menu_level);
+void lcd_helpScreen(char view);
+void lcd_show_inputs(void);
+unsigned long menu_timeout;
 char echoLcdToTouchscreen;  // to control echo of lcd messages to the touch screen
 #define  lcd_NO_BUTTONS        ""
 #define  lcd_WITH_BUTTONS      " "
@@ -461,7 +565,8 @@ char arrival_from;          // indicates if main is ready for receive or in arri
 char transStation, diverterStation;
 char malfunctionActive;
 char carrier_attn, carrier_attn2;
-char system_state, systemDirection;
+char system_state, transDirection;
+char doorWasOpen;
 #define FLAG_SECURE      0x20
 char transFlags;
 char handleSecure;
@@ -485,6 +590,7 @@ struct {
    unsigned long time;
 } secureCard, stdCard, unauthCard;
 unsigned long arrivalTime;
+static struct stats_type statistics;
 
 /* Array index values for remote data, returned by INPUTS_ARE command. */
 #define REMOTE_CIC      0
@@ -503,7 +609,8 @@ main()
    char key, simonsays;
    auto rn_search newdev;
    int status;
-char UID[15];
+	char UID[15];
+	char txt[6];
 //	unsigned long R[2];
 //	unsigned short fac, id;
 //	int wr;
@@ -529,6 +636,10 @@ char UID[15];
    // show startup screen
    lcd_splashScreen(0);
 
+	// allocate xmem for transaction log
+	initTransLog();
+   loadTransactionCount();   // Read transaction counter from EEPROM
+
    hitwd();
    init_io();
    arrival_alert(aaRESET, 0);
@@ -536,9 +647,13 @@ char UID[15];
 	readParameterSettings();
 
    /* read board address and set configuration i/o mappings */
-   THIS_DEVICE = (di_remoteAddress);
+   //THIS_DEVICE = (di_remoteAddress);
+   THIS_DEVICE = param.stationNum; // get device/station from parameter instead of digital inputs
+   if ((THIS_DEVICE < 1) || (THIS_DEVICE > 7)) THIS_DEVICE = 1;  // default to 1 when out of range
    THIS_DEVICE_b = station2bit(THIS_DEVICE);
-   //if (PRINT_ON) printf("\nThis is remote plc # %d", THIS_DEVICE);
+   lcd_DispText("Device/Station: ",0,0,MODE_NORMAL);
+   sprintf(txt, "%d\n", THIS_DEVICE);
+   lcd_DispText(txt,0,0,MODE_NORMAL);
 
    // flash the plc number
    //flasher(0);
@@ -564,7 +679,9 @@ char UID[15];
 #ifdef USE_TCPIP
 	// setup default static IP using THIS_DEVICE (myIPaddress = MY_BASE_IP + THIS_DEVICE)
 	sprintf(myIPaddress, MY_BASE_IP, THIS_DEVICE);
-   printf("My IP address: %s\n", myIPaddress);
+   //printf("My IP address: %s\n", myIPaddress);
+   lcd_DispText("IP address: ",0,0,MODE_NORMAL);
+   lcd_DispText(myIPaddress,0,0,MODE_NORMAL);
    // configure the interface
    if(sock_init()) printf("IP sock_init() failed\n");	// Initialize UDP communications
 	ifconfig(IF_ETH0,
@@ -591,8 +708,12 @@ char UID[15];
    // Initialize card reader
    cardReaderInit();
 
-lcd_drawScreen(1, "TEST");
-
+	lcd_drawScreen(1, "TEST");
+   systemStateMsg=4; // INITIAL systemStateMsg PAUSED
+	lcd_RefreshScreen(1); // force refresh of messages
+//for (systemStateMsg=0; systemStateMsg<8; systemStateMsg++)
+//{  lcd_RefreshScreen(0);
+//}
    thistime=MS_TIMER;
    lost=0;
 	heartbeat_interval=100;
@@ -600,6 +721,8 @@ lcd_drawScreen(1, "TEST");
    while(simonsays)
    {  // loop forever
       maintenance();  // Hit WD, flash LEDs, write outputs, tcp tick
+		lcd_RefreshScreen(0);
+      lcd_ProcessButtons();
 
       /* check for and process incoming commands */
       if (get_command(&message)) process_command(message);
@@ -772,6 +895,7 @@ void process_local_io()
       //LA_Timer=0;
       mainStation=0;
       param.subStaAddressing=FALSE;
+      doorWasOpen=0;
    }
 
    /* Check for diverter and blower attention */
@@ -784,8 +908,10 @@ void process_local_io()
    /* Use local buffers for some inputs */
    if (param.opMode == STD_REMOTE)
    {  // stuff for standard remote inputs
-      rts_data=requestToSend(MY_STATIONS);
-      rts2_data=requestToSend2(MY_STATIONS);
+      rts_data=requestToSend(MY_STATIONS);  // check for digital input send button
+      //rts2_data=requestToSend2(MY_STATIONS);
+      if (rts_data==0) rts_data=lcd_SendButton();  // if no digital button then try screen button
+      rts2_data=0; //requestToSend2(MY_STATIONS);
       cic_data=carrierInChamber(MY_STATIONS);
       door_closed=doorClosed(MY_STATIONS);
 
@@ -847,7 +973,13 @@ void process_local_io()
 
       // locally handle the alert for door open during transaction
       if (door_closed) doorAlert(OFF);
-      else if (isMyStation(transStation)) doorAlert(ON);
+      else
+      {  if (isMyStation(transStation))
+      	{	doorAlert(ON);
+            doorWasOpen=TRUE;
+         }
+      }
+
 
       // Check for and process door unlock
       processCardReads();
@@ -934,7 +1066,7 @@ void processCardReads(void)
          // if there is a returning transaction from me
          // then may be due to an auto or manual return
          // therefore clear the handling of secure transactions
-         if (systemDirection == DIR_RETURN) handleSecure=FALSE;
+         if (transDirection == DIR_RETURN) handleSecure=FALSE;
       }
       else
       {  // no active transaction, so what next
@@ -1031,7 +1163,7 @@ void process_command(struct iomessage message)
 //#warnt "NEED TO FIX LOGIC OF HANDLING DEVICE > 7"
          response.data[0]=THIS_DEVICE_b;   // CONSIDER TO SEND DECIMAL NUMBER AND LET HOST ASSEMBLE THE COLLECTIVE RESPONSE
          transStation=message.station;
-         systemDirection=message.data[0];
+         transDirection=message.data[0];
          mainStation=message.data[1];  // get the main station to be used
          //transFlags=message.data[3];   // transaction flags such as STAT & Secure
          // Negate assumption if not ready
@@ -1298,6 +1430,7 @@ void process_command(struct iomessage message)
             {  // capture the main arrival flag
             }
          } // nothing else for head diverter
+
          break;
 
       case MALFUNCTION:  // may be contributing to funky flashing
@@ -1406,9 +1539,14 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
 	static char lastTransStation;  // to keep track of when transStation changes
 	char UID[15];
    char bUID[7];
-   int i;
+   int i, j;
+   struct tm time;
    static char new_state;
 
+   #GLOBAL_INIT
+   {
+      new_state=0;
+   }
 
   	//printf("\n  Got UDP message %c at %ld, %d, %d, %ld", UDPmessage.command, UDPmessage.timestamp, latchCarrierArrival, arrivalISRstate, arrivalDuration);
    /* determine what type of command */
@@ -1432,19 +1570,86 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
          alert(OFF, MY_STATIONS);  // in case it was on??
          doorAlert(OFF);           // ditto
          // set arrival alert if the transaction is to here
-         if (UDPmessage.data[0] == DIR_SEND && isMyStation(UDPmessage.station))
-         {  if (UDPmessage.data[1]==1)  // and Main says to set arrival alert
-            { // OK to set alert
-               if ((mainStation==SLAVE) && (param.subStaAddressing==TRUE))
-                     carrier_attn2 = 1; //|= station2bit(UDPmessage.station);  // to flash inuse
-               else  carrier_attn = 1; //|= station2bit(UDPmessage.station);  // to flash inuse
-               arrival_alert(aaSET, 1); //UDPmessage.station);
+         if (isMyStation(UDPmessage.station))
+         {
+	         if (UDPmessage.data[0] == DIR_SEND)
+	         {
+            	//if (UDPmessage.data[1]==1)  // and Main says to set arrival alert
+               if (param.remoteAudibleAlert)  // and WE say to set arrival alert
+	            { // OK to set alert
+	               if ((mainStation==SLAVE) && (param.subStaAddressing==TRUE))
+	                     carrier_attn2 = 1; //|= station2bit(UDPmessage.station);  // to flash inuse
+	               else  carrier_attn = 1; //|= station2bit(UDPmessage.station);  // to flash inuse
+	               arrival_alert(aaSET, 1); //UDPmessage.station);
+	            }
+	            gotPinRead=FALSE;  // Reset any PIN and card reads
+	            gotCardRead=FALSE;
+	            arrivalTime=SEC_TIMER;  // used with secureRemovalTime
+               statistics.trans_in++;
+	         } else {
+            	statistics.trans_out++;
             }
-	         gotPinRead=FALSE;  // Reset any PIN and card reads
-	         gotCardRead=FALSE;
-            arrivalTime=SEC_TIMER;  // used with secureRemovalTime
+	         // record in the log
+
+            translog.source_sta=UDPmessage.station;
+            translog.status |= UDPmessage.data[3]; // local or global status
+            translog.flags = UDPmessage.data[4]; // local or global flags
+	         translog.duration=(int)(SEC_TIMER-translog.start_tm);
+	         addTransaction( translog, 0 );
+            // update alarm statistics
+            if (translog.status==3) statistics.deliv_alarm++;            // incomplete delivery timeout alarm
+				else if (translog.status==2) statistics.cic_lift_alarm++;
+            if (doorWasOpen)
+            {	statistics.door_alarm++;
+            	doorWasOpen=0;
+            }
          }
+         // refresh screen on trans complete
+        	lcd_RefreshScreen(1); // force refresh of messages
+
       	break;
+
+      case SET_DIVERTER:
+// debug to see what may be causing loss of communication
+//lastcommand=message.command;
+
+			if (isMyStation(UDPmessage.station))
+         {
+	         if (param.opMode == STD_REMOTE)
+	         {  // stuff for standard remote
+	            if (param.subStaAddressing && UDPmessage.data[1]==SLAVE)
+	               inUse2(FLASH, station2bit(UDPmessage.station));
+	            else
+	               inUse(FLASH, station2bit(UDPmessage.station));
+#ifdef USE_DIVERTER
+	            setDiverter(UDPmessage.station);
+#endif
+	         } else
+	         {  // stuff for head diverter
+#ifdef USE_DIVERTER
+	            setDiverter(UDPmessage.data[0]);  // head diverter comes in different byte
+#endif
+	         }
+	         mainStation=UDPmessage.data[1];  // get the main station to be used
+	         param.subStaAddressing=UDPmessage.data[2];
+	         param.blowerType = UDPmessage.data[3];
+	         transFlags = UDPmessage.data[4];    // transaction flags such as STAT & Secure
+	         if (transFlags & FLAG_SECURE) handleSecure = TRUE;
+
+	         // starting a transaction?  let's assume
+	         translog.trans_num = transactionCount()+1;
+	         //eventlog.trans_num = translog.trans_num;
+	         translog.start_tm = SEC_TIMER;
+	         translog.duration = 0;
+	         translog.source_sta = 0;
+	         translog.dest_sta = 0;
+	         translog.status = 0;
+	         translog.flags=transFlags;
+	      }
+
+
+
+         break;
 
       case REMOTE_PAYLOAD:  // standard data distribution message
          arrival_from = UDPmessage.data[0];
@@ -1461,7 +1666,7 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
 				UID_Clear(unauthCard.id);
          }
          malfunctionActive = (new_state == MALFUNCTION_STATE);
-         systemDirection = UDPmessage.data[11];
+         transDirection = UDPmessage.data[11];
          purge_mode = UDPmessage.data[12];
 
          // handle capture of secure transaction
@@ -1492,6 +1697,42 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
 
       	break;
 
+	   case SET_STATION_NAME:
+	      if (UDPmessage.station==69)
+	      {  // construct messages and save parameters to flash
+	         //buildStationNames();
+	         writeParameterSettings();
+            printf("Set station name %s\n", param.stationName);
+            printf("Set main name %s\n", param.mainName);
+	         lcd_drawScreen(1, lcd_WITH_BUTTONS);      // redraw main screen
+	         lcd_RefreshScreen(1);
+	      } else
+	      {  if (UDPmessage.station == param.stationNum)
+         	{  // is my station
+	         	// save chunk of name
+		         i=UDPmessage.data[0];
+	   	      for (j=0; j<4; j++) param.stationName[i+j] = UDPmessage.data[j+1];
+            } else if (UDPmessage.station == 0)  // 0 is main; 9 is system
+            {  // main station name
+	         	// save chunk of name
+		         i=UDPmessage.data[0];
+	   	      for (j=0; j<4; j++) param.mainName[i+j] = UDPmessage.data[j+1];
+            } // else not my station
+	      }
+	      break;
+
+	   case SET_DATE_TIME:
+	      tm_rd(&time);  // read all time data
+	      time.tm_year=UDPmessage.data[0];
+	      time.tm_mon=UDPmessage.data[1];
+	      time.tm_mday=UDPmessage.data[2];
+	      time.tm_hour=UDPmessage.data[3];
+	      time.tm_min=UDPmessage.data[4];
+         time.tm_sec=UDPmessage.station;
+	      tm_wr(&time);  // write new time data
+	      SEC_TIMER = mktime(&time);   // resync SEC_TIMER
+	      break;
+
       case SET_CARD_PARAMS:
 ///         param.cardL3Digits = UDPmessage.data[0];
 ///         param.cardR9Min = *(unsigned long *)&UDPmessage.data[1];
@@ -1514,6 +1755,14 @@ void processUDPcommand(struct UDPmessageType UDPmessage)
       blower(blowerStateTable[system_state][0]); // always config 0 (standard blower)
 #endif
 	}
+   // update system state message EVERY TIME
+   if (system_state==IDLE_STATE) systemStateMsg = 1; // READY
+   else if (system_state==HOLD_TRANSACTION) systemStateMsg = 4;  // PAUSED
+   else if (system_state==MALFUNCTION_STATE) systemStateMsg = 6; // ALARM
+   else if (transStation!=THIS_DEVICE) systemStateMsg = 5; // BUSY
+   else if (transDirection==DIR_RETURN) systemStateMsg = 3; // SENDING
+   else systemStateMsg = 2; // RECEIVING
+   if (isMyStation(bit2station(arrival_from))) systemStateMsg = 8; // waiting for removal at main
 }
 
 unsigned long alert_timer[8];   // for stations 1..7     ...  [0] is not used.
@@ -2192,7 +2441,10 @@ void msDelay(unsigned int delay)
    if (delay < 500) while( (MS_TIMER - start_time) <= delay );
    else while( (MS_TIMER - start_time) <= delay ) hitwd();
 }
-
+nodebug char secTimeout(unsigned long ttime)
+{
+   return (ttime > SEC_TIMER) ? FALSE : TRUE;
+}
 char Timeout(unsigned long start_time, unsigned long duration)
 {
    return ((MS_TIMER - start_time) < duration) ? FALSE : TRUE;
@@ -2507,7 +2759,7 @@ void lcd_drawScreen(char whichScreen, char *title)
    //  5: header with exit button
    //  6: header keyboard, next, exit
    //  7: header clock up/downs, exit
-   //  8: transaction log: pgup, pgdn, done
+   //  8: transaction log: pgup, pgdn, help, done
    //  9: header, keypad, next, exit
    // 10: header keyboard, OK, cancel
    int x, dx;
@@ -2536,15 +2788,16 @@ void lcd_drawScreen(char whichScreen, char *title)
 	   if (title[0] != 0) // Buttons? (any) or not ("")
 		{
 	      {
-	         // Draw a box for top row of bottom buttons
-	         lcd_BFcolorsB( lcd_LBLUE, lcd_LBLUE );   // inside color
+	         // Draw boxes for bottom buttons
+	         //lcd_BFcolorsB( lcd_LBLUE, lcd_LBLUE );   // inside color
+            // for send button
+			   lcd_BFcolorsB( lcd_LBLUE, lcd_GREY);  // inside color
 	         lcd_Rectangle(5, 179, 235, 270, 1);      // inside paint 158 -> 140
 	         lcd_BFcolorsB( lcd_BLUE, lcd_WHITE);     // border color
 	         lcd_Rectangle(5, 179, 235, 270, 0);      // border paint
-	         lcd_Font("13B");
 
-	         // Draw a box for menu/help
-	         lcd_BFcolorsB( lcd_LGREEN, lcd_LGREEN );   // inside color
+	         // for menu/help
+	         lcd_BFcolorsB( lcd_LBLUE, lcd_GREY );   // inside color
 	         lcd_Rectangle(5, 270, 235, 317, 1);      // inside paint
 	         lcd_BFcolorsB( lcd_BLUE, lcd_WHITE);     // border color
 	         lcd_Rectangle(5, 270, 235, 317, 0);      // border paint
@@ -2570,11 +2823,12 @@ void lcd_drawScreen(char whichScreen, char *title)
 	            BTN_BMP, BMP_med_button, BMP_med_button_dn,
 	            BTN_END );
 
-	         lcd_Font("24B");
+	         lcd_Font("32B");
+	         lcd_BFcolorsB( lcd_WHITE, lcd_LGREY);     // border color
 	         lcd_ButtonDef( BTN_SEND,
-	            BTN_TLXY, 77, 208,
+	            BTN_TLXY, 77, 204,
 	            BTN_TEXT, "SEND",
-	            BTN_TXTOFFSET, 17, 8,
+	            BTN_TXTOFFSET, 7, 3,
 	            BTN_BMP, BMP_92x40_button, BMP_92x40_button_dn,
 	            BTN_END );
 
@@ -2585,21 +2839,13 @@ void lcd_drawScreen(char whichScreen, char *title)
 	   lcd_Rectangle(5, 5, 235, 60, 1);       // border paint
 	   lcd_BFcolorsB( lcd_BLUE, lcd_LGREY);  // border color
 	   lcd_Rectangle(5, 5, 235, 60, 0);       // border paint
-	   lcd_Rectangle(5, 60, 235, 179, 0);     // border paint
+	   lcd_Rectangle(5, 60, 235, 130, 0);     // border paint
+	   lcd_Rectangle(5, 130, 235, 179, 0);     // border paint
 
       // since this screen was just cleared, for a refresh of the lcd messages
 ///      reset_msg_timer(NOW);
 
-// PROTOTYPING MESSAGES
-lcd_Font("32B");
-lcd_BFcolorsB( lcd_BLACK, lcd_LGREY);
-lcd_DispText("READY", 70, 14, MODE_TRANS);
-lcd_BFcolorsB( lcd_GREEN, lcd_LGREY);
-lcd_DispText("CARRIER", 60, 70, MODE_TRANS);
-lcd_BFcolorsB( lcd_LGREY, lcd_LGREY);
-lcd_DispText("ARRIVED", 60, 100, MODE_TRANS);
-lcd_BFcolorsB( lcd_RED, lcd_LGREY);
-lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
+
 
 
 
@@ -2612,7 +2858,7 @@ lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
 	   lcd_Font("16B");
 	   lcd_ButtonDef( BTN_PREV,
 	      BTN_MOM,                      // momentary operation
-	      BTN_TLXY, 5, 205,             // starting x,y for buttons
+	      BTN_TLXY, 5, 280,             // starting x,y for buttons
 		   BTN_TYPE, BUTTON_RELEASE,
 	      BTN_MARGINS, 5, 330,         // set left and right margins
 	      BTN_SEP, 63, 43,              // set up for button sep
@@ -2632,7 +2878,7 @@ lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
 */
 	   lcd_ButtonDef( BTN_CANCEL,
 	      //BTN_TXTOFFSET, 5, 9,
-	      BTN_TLXY, 257, 205,             // starting x,y for buttons
+	      BTN_TLXY, 170, 280,             // starting x,y for buttons
 	      BTN_TEXT, "Done",
 	      BTN_END );
 
@@ -2641,13 +2887,13 @@ lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
       break;
    case 4:
 
-///      lcd_ShowKeypad(0);
+      lcd_ShowKeypad(0);
 
 	   // Draw bottom buttons
 	   lcd_Font("16B");
 	   lcd_ButtonDef( BTN_OK,
 	      BTN_MOM,                      // momentary operation
-	      BTN_TLXY, 5, 205,             // starting x,y for buttons
+	      BTN_TLXY, 5, 280,             // starting x,y for buttons
 		   BTN_TYPE, BUTTON_RELEASE,
 	      BTN_TEXT, "OK",
 	      BTN_MARGINS, 5, 330,         // set left and right margins
@@ -2656,7 +2902,7 @@ lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
 	      BTN_END );
 	   lcd_ButtonDef( BTN_CANCEL,
 	      BTN_TXTOFFSET, 5, 9,
-	      BTN_TLXY, 257, 205,           // starting x,y for buttons
+         BTN_TLXY, 170, 280,
 	      BTN_TEXT, "Cancel",
 	      BTN_END );
       break;
@@ -2666,7 +2912,7 @@ lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
 	   lcd_Font("16B");
 	   lcd_ButtonDef( BTN_EXIT,
 	      BTN_MOM,                      // momentary operation
-	      BTN_TLXY, 257, 205,             // starting x,y for buttons
+	      BTN_TLXY, 170, 280,             // starting x,y for buttons
 		   BTN_TYPE, BUTTON_RELEASE,
 	      BTN_MARGINS, 5, 330,         // set left and right margins
 	      BTN_SEP, 63, 43,              // set up for button sep
@@ -2737,15 +2983,15 @@ lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
       lcd_ButtonDef( 9, BTN_MOM, BTN_TEXT, "-", BTN_END );
       break;
 
-   case 8:  // PgUp, PgDn, Done
+   case 8:  // PgUp, PgDn, Help, Done
 	   // Draw bottom buttons
 	   lcd_Font("16B");
 	   lcd_ButtonDef( BTN_PREV,
 	      BTN_MOM,                      // momentary operation
-	      BTN_TLXY, 5, 205,             // starting x,y for buttons
+	      BTN_TLXY, 1, 285,             // starting x,y for buttons
 		   BTN_TYPE, BUTTON_RELEASE,
-	      BTN_MARGINS, 5, 330,         // set left and right margins
-	      BTN_SEP, 63, 43,              // set up for button sep
+	      BTN_MARGINS, 1, 330,         // set left and right margins
+	      BTN_SEP, 60, 43,              // set up for button sep
 	      BTN_TEXT, "PgUp",
 	      BTN_TXTOFFSET, 8, 9,
 	      BTN_BMP, BMP_med_button, BMP_med_button_dn,
@@ -2753,8 +2999,11 @@ lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
 	   lcd_ButtonDef( BTN_NEXT,
 	      BTN_TEXT, "PgDn",
 	      BTN_END );
+      lcd_ButtonDef( BTN_HELP,
+         BTN_TXTOFFSET, 12, 9,
+         BTN_TEXT, "Help",
+         BTN_END );
 	   lcd_ButtonDef( BTN_CANCEL,
-	      BTN_TLXY, 257, 205,             // starting x,y for buttons
 	      BTN_TEXT, "Exit",
 	      BTN_END );
 
@@ -2811,9 +3060,1595 @@ int lcd_Center(char * string, char font)
 {
 	int temp;
 
-   if (font==1)      temp = 160 - (int)(strlen(string) * 7);  // "24"
-   else if (font==2) temp = 160 - (int)(strlen(string) * 4);  // "16"
-   if (temp < 5) temp = 5;
+   if (font==1)      temp = 120 - (int)(strlen(string) * 7);  // "24"
+   else if (font==2) temp = 120 - (int)(strlen(string) * 4);  // "16"
+   else if (font==3) temp = 120 - (int)(strlen(string) * 9);  // "32"
+   if (temp < 6) temp = 6;
 	return temp;
+}
+int lcd_RefreshScreen(char refresh)
+{  // update system status and local status
+   // refresh = 0: update screen only when status is changing
+   // refresh else: rewrite all messages
+   static char mydoor, mycic, myssm;
+   char cicmsg;
+   char ypos;
+   char buf[20];
+   struct tm time;
+   static unsigned long lastclock;
+   char flashSend;
+   static char lastFlashSend;
+   int bgColor;
+
+	lcd_Font("32B");
+   // update system state message
+   if ((systemStateMsg != myssm) || (refresh))
+	{  // erase last message
+	   lcd_BFcolorsB( lcd_LGREY, lcd_LGREY);  // color
+	   lcd_Rectangle(10, 10, 225, 55, 1);       // paint
+      lcd_BFcolorsB( lcd_BLACK, lcd_LGREY);
+      ypos=18;
+      if (systemStateMsg == 8)
+      {  lcd_Font("24B");
+      	lcd_DispText("WAIT FOR REMOVAL", 15, ypos-5, MODE_NORMAL);
+         lcd_Font("24B");
+         strcpy(buf, "AT ");
+         strcat(buf, param.mainName);
+         lcd_DispText(buf, lcd_Center(buf,1), ypos+15, MODE_NORMAL);
+      }
+   	else if (systemStateMsg == 1) lcd_DispText("READY", 75, ypos, MODE_NORMAL);
+   	else if (systemStateMsg == 2) lcd_DispText("RECEIVING", 45, ypos, MODE_NORMAL);
+   	else if (systemStateMsg == 3) lcd_DispText("SENDING", 59, ypos, MODE_NORMAL);
+   	else if (systemStateMsg == 4) lcd_DispText("PAUSED", 65, ypos, MODE_NORMAL);
+   	else if (systemStateMsg == 5) lcd_DispText("BUSY", 80, ypos, MODE_NORMAL);
+   	else if (systemStateMsg == 6) lcd_DispText("ALARM", 75, ypos, MODE_NORMAL);
+   	else if (systemStateMsg == 7) lcd_DispText("QUEUED", 65, ypos, MODE_NORMAL);
+      else lcd_DispText("UNKNOWN", 50, 18, MODE_TRANS);
+		//lcd_BFcolorsB( lcd_GREEN, lcd_LGREY);
+      myssm = systemStateMsg;
+   }
+
+   // what is carrier status 1, 2, 3
+   // WHAT ABOUT IN-ROUTE TO (FROM) MAIN
+   if (isMyStation(transStation))
+   { 	cicmsg = 5; bgColor = lcd_WHITE; // sending to/from main
+   } else if (carrier_attn)
+   {  cicmsg = 1; bgColor = lcd_YELLOW;
+   } else if (rts_latch)
+   {  cicmsg = 4; bgColor = lcd_MAGENTA;
+   } else if (carrierInChamber(MY_STATIONS))
+   {  cicmsg = 2; bgColor = lcd_GREEN;
+   } else
+   {  cicmsg = 3; bgColor = lcd_WHITE;    // no carrier nothing else active
+   }
+
+   // update carrier message
+   if ((cicmsg != mycic) || refresh)
+	{  // status has changed, update message
+   	// draw colored box
+		lcd_Font("32B");
+	   lcd_BFcolorsB( bgColor, bgColor);
+	   lcd_Rectangle(6, 61, 234, 129, 1);   // Fill the area
+      lcd_BFcolorsB( lcd_BLACK, bgColor);
+      if (cicmsg==3) // no carrier
+      {  // different message style for this
+			lcd_Font("24B");
+	      lcd_DispText("INSERT CARRIER", 32, 70, MODE_NORMAL);
+	      lcd_DispText("AND PRESS SEND", 28, 97, MODE_NORMAL);
+		} else if (cicmsg==5)
+      {  // in route to main
+	   	if (transDirection==DIR_SEND) strcpy(buf, "IN ROUTE FROM");
+         else strcpy(buf, "IN ROUTE TO");
+         lcd_DispText(buf, lcd_Center(buf,3), 67, MODE_NORMAL);
+         lcd_DispText(param.mainName, lcd_Center(param.mainName,3), 97, MODE_NORMAL);
+         refresh=TRUE;  // Force update of door message
+      } else
+	   {  // 1st line "CARRIER"
+      	lcd_DispText("CARRIER", 60, 67, MODE_TRANS);
+	      if (cicmsg==1)
+	      {  // carrier arrival
+	         //lcd_BFcolorsB( lcd_RED, lcd_WHITE);
+	         lcd_DispText("ARRIVED ", 63, 97, MODE_NORMAL);
+	      } else if (cicmsg==2)
+	      { // carrier in chamber
+	         //lcd_BFcolorsB( lcd_GREEN, lcd_WHITE);
+	         lcd_DispText(" READY   ", 63, 97, MODE_NORMAL);
+	      } else if (cicmsg==4)
+	      { // carrier in chamber
+	         //lcd_BFcolorsB( lcd_MAGENTA, lcd_WHITE);
+	         lcd_DispText("QUEUED  ", 63, 97, MODE_NORMAL);
+	      }
+      }
+      mycic = cicmsg;
+	}
+   // update door message
+   if ((doorClosed(MY_STATIONS) != mydoor) || refresh)
+   {  // door status has changed or forced refresh
+		lcd_Font("32B");
+	   if (doorClosed(MY_STATIONS))
+	   { // door is closed
+         lcd_BFcolorsB( lcd_WHITE, lcd_WHITE);
+         lcd_Rectangle(6, 131, 234, 178, 1);   // Fill the area
+         lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+	      if (isMyStation(transStation))
+         {  // busy, do not use
+				lcd_Font("24B");
+	         lcd_DispText("BUSY DO NOT USE", 20, 140, MODE_TRANS);
+         }
+         else
+         {  // normal
+	         lcd_DispText("DOOR CLOSED", 20, 140, MODE_TRANS);
+         }
+	   } else
+	   { // door is opened
+	      lcd_BFcolorsB( lcd_YELLOW, lcd_YELLOW);
+		   lcd_Rectangle(6, 131, 234, 178, 1);   // Fill the area
+	      lcd_BFcolorsB( lcd_BLACK, lcd_YELLOW);
+		   lcd_DispText("DOOR OPEN", 40, 140, MODE_TRANS);
+	   }
+      mydoor = doorClosed(MY_STATIONS);
+   }
+
+   // EMPHASIZE SEND BUTTON WHEN THE PLANETS ALIGN
+   // CIC, DOOR CLOSED, SYSTEM READY)
+   if ((cicmsg==2) && (doorClosed(MY_STATIONS)) && (systemStateMsg == 1))
+   {  // highlight send
+      flashSend=TRUE;
+   } else
+   {  // regular send
+      flashSend=FALSE;
+   }
+   if ((flashSend != lastFlashSend) || refresh)
+   {  // state changed
+   	if (flashSend)
+      {  lcd_BFcolorsB( lcd_BLACK, lcd_GREEN );
+      } else
+      {  lcd_BFcolorsB( lcd_WHITE, lcd_LGREY );
+      }
+      lcd_Font("32B");
+      lcd_DispText("SEND", 84, 207, MODE_NORMAL);
+   	lastFlashSend=flashSend;
+   }
+
+   // show station name and clock
+   if (SEC_TIMER != lastclock)
+   {  lastclock=SEC_TIMER;
+	   lcd_Font("13B");
+	   lcd_BFcolorsB( lcd_BLACK, lcd_LBLUE);
+	   lcd_DispText(param.stationName, lcd_Center(param.stationName,2), 276, MODE_NORMAL);
+	   tm_rd(&time);  // read all time data
+	   sprintf(buf, "%02d/%02d/%02d", time.tm_mon, time.tm_mday, time.tm_year%100);
+	   lcd_DispText(buf, 88, 289, MODE_NORMAL);
+	   sprintf(buf, "%02d:%02d:%02d", time.tm_hour, time.tm_min, time.tm_sec);
+	   lcd_DispText(buf, 90, 302, MODE_NORMAL);
+   }
+
+}
+char lcd_stationButton;
+void lcd_ProcessButtons(void)
+{  char button;
+	button = lcd_GetTouch(1);
+   if (button > 0)
+	{  if (button == BTN_SEND)
+   	{  lcd_stationButton=1;
+      }
+	   else if (button == BTN_MENU)
+      {  // enter setup menu
+         lcd_enterSetupMode(1);
+		   lcd_drawScreen(1, lcd_WITH_BUTTONS);		// redraw main screen
+			lcd_RefreshScreen(1);
+      }
+	   else if (button == BTN_HELP)
+      {
+      	lcd_helpScreen(0);
+		   lcd_drawScreen(1, lcd_WITH_BUTTONS);		// redraw main screen
+			lcd_RefreshScreen(1);
+      }
+   }
+
+}
+char lcd_SendButton(void)
+{  // returns the lcd_stationButton
+	char rtnVal;
+   #GLOBAL_INIT
+   { lcd_stationButton=0; }
+
+   rtnVal = lcd_stationButton;
+   lcd_stationButton=0; // reset whenever it is accesses
+	return rtnVal;
+}
+/******************************************************************/
+// MAKING DESIGN ASSUMPTION --> MNU_xxx value is the same as the index in menu[]
+// define menu item numbers
+enum MenuItems {
+	   MNU_COMM_STAT,
+	   MNU_SETPASSWORD,
+      MNU_CLEARPASSWORDS,
+	   MNU_DEF_STATIONS,
+      MNU_RESET,
+      MNU_ADMIN_FEATURES,
+      MNU_MAINT_FEATURES,
+      MNU_SYSTEM_CONFIG,
+      MNU_VIEW_LOGS,
+      MNU_VIEW_TLOG, // Transaction log
+      MNU_VIEW_SLOG, // Summary log
+      MNU_VIEW_ELOG, // Event log
+      MNU_VIEW_ALOG, // Alarm log
+      MNU_CHECK_SFLASH,
+      MNU_ANALYZE_LOG,
+      MNU_LCD_CALIBRATE,
+      MNU_SHOW_IPADDR,
+      MNU_SHOW_INPUTS,
+      MNU_SET_STATION,
+      MNU_RARRIVAL_BEEP,
+	   MNU_LAST
+};
+
+// Define bitmasks for activation of menu items
+#define MNU_ADV  0x0E
+#define MNU_STD  0x01
+#define MNU_ALRM 0x10
+#define MNU_NONE 0x00
+// Define parameter types
+#define MNU_FLAG 01
+#define MNU_VAL  02
+#define MNU_TIME 03
+#define MNU_CLK  04
+#define MNU_OTHR 05
+// define parameter menu
+char NOch;       // dummy/temporary character place holder
+const struct{
+   char item;   // menu item
+   //char usage;  // when available to the user
+   char *msg1;  // pointer to message
+   char partype;  // parameter type (flag, clock, integer value, other)
+   char *parval;  // parameter value
+   unsigned long min;  // parameter minimum
+   unsigned long max;  // parameter maximum (or don't save flag changes [=0])
+   char units[4];  // parameter units display
+   } menu[] = {
+ MNU_COMM_STAT,      "SHOW COMMUNICATIONS",MNU_OTHR, &NOch, 0, 0, "",
+ MNU_SETPASSWORD,    "SET PASSWORD",       MNU_OTHR, &NOch, 0, 0, "",
+ MNU_CLEARPASSWORDS, "CLEAR PASSWORDS",    MNU_OTHR, &NOch, 0, 0, "",
+ MNU_DEF_STATIONS,   "SET ACTIVE STATIONS",MNU_OTHR, &NOch, 0, 0, "",
+ MNU_RESET,          "RESTART SYSTEM",     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_ADMIN_FEATURES, "ADMIN FEATURES",     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_MAINT_FEATURES, "MAINT FEATURES",     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_SYSTEM_CONFIG,  "SYSTEM CONFIG",      MNU_OTHR, &NOch, 0, 0, "",
+ MNU_VIEW_LOGS,      "VIEW LOGS",          MNU_OTHR, &NOch, 0, 0, "",
+ MNU_VIEW_TLOG,      "VIEW TRANSACTIONS",  MNU_OTHR, &NOch, 0, 0, "",
+ MNU_VIEW_SLOG,      "VIEW SUMMARY LOG",   MNU_OTHR, &NOch, 0, 0, "",
+ MNU_VIEW_ELOG,      "VIEW EVENT LOG",     MNU_OTHR, &NOch, 0, 0, "",
+ MNU_VIEW_ALOG,      "VIEW RECENT ALARMS", MNU_OTHR, &NOch, 0, 0, "",
+ MNU_CHECK_SFLASH,   "CHECK SERIAL FLASH", MNU_OTHR, &NOch, 0, 0, "",
+ MNU_ANALYZE_LOG,    "ANALYZE EVENT LOG",  MNU_OTHR, &NOch, 0, 0, "",
+ MNU_LCD_CALIBRATE,  "CALIBRATE SCREEN",   MNU_OTHR, &NOch, 0, 0, "",
+ MNU_SHOW_IPADDR,    "SHOW IP ADDRESS",    MNU_OTHR, &NOch, 0, 0, "",
+ MNU_SHOW_INPUTS,    "SHOW INPUTS",        MNU_OTHR, &NOch, 0, 0, "",
+ MNU_SET_STATION,    "SET STATION NUMBER", MNU_VAL,  (char *)&param.stationNum, 1, 7, "",
+ MNU_RARRIVAL_BEEP,  "SET AUDIBLE ALERT",  MNU_FLAG, &param.remoteAudibleAlert, 0, 1, "",
+ MNU_LAST,           "END",                MNU_NONE, &NOch, 0, 0, "" };
+
+char menuOrder[25];
+void setupMenuOrder(char menuLevel)
+{
+	char i;
+   i=0;
+	// content of menu depends on if passwords are enabled or not
+   switch (menuLevel)
+   {
+   case 0: // ALARM
+   	break;
+   case 1: // Basic User
+      menuOrder[i++]=MNU_VIEW_LOGS;
+      //menuOrder[i++]=MNU_MAINT_FEATURES;
+		//menuOrder[i++]=MNU_ADMIN_FEATURES; // do allow admin for slave
+      menuOrder[i++]=MNU_SYSTEM_CONFIG;
+      menuOrder[i++]=MNU_RARRIVAL_BEEP;
+   	break;
+   case 2: // Administrator
+   	break;
+   case 3: // Maintenance
+   	break;
+   case 4: // System configuration (Colombo only)
+      menuOrder[i++]=MNU_SET_STATION;
+      //menuOrder[i++]=MNU_DEF_STATIONS;
+      //menuOrder[i++]=MNU_SHOW_IPADDR;
+      menuOrder[i++]=MNU_SHOW_INPUTS;
+      menuOrder[i++]=MNU_SETPASSWORD;
+      menuOrder[i++]=MNU_CLEARPASSWORDS;
+      //menuOrder[i++]=MNU_CHECK_SFLASH;
+      //menuOrder[i++]=MNU_ANALYZE_LOG;
+      menuOrder[i++]=MNU_LCD_CALIBRATE;
+      menuOrder[i++]=MNU_RESET;
+   	break;
+   case 5: // view logs
+      menuOrder[i++]=MNU_VIEW_SLOG; // transaction summary
+      menuOrder[i++]=MNU_VIEW_TLOG; // transaction log
+      //menuOrder[i++]=MNU_VIEW_ELOG; // event log
+      menuOrder[i++]=MNU_VIEW_ALOG; // alarm log
+   	break;
+   case 6: // secure card setup
+      //menuOrder[i++]=MNU_SECURE_ENABLE;
+		//menuOrder[i++]=MNU_CARDID_ENABLE;
+      //menuOrder[i++]=MNU_SERVER_ADDRESS;
+      //menuOrder[i++]=MNU_SYNC_INTERVAL;
+      //menuOrder[i++]=MNU_RESYNC_USERS;
+      //menuOrder[i++]=MNU_CARD_FORMAT;
+      //menuOrder[i++]=MNU_SECURE_R9MAX;
+      //menuOrder[i++]=MNU_SECURE2_L3DIGITS;
+      //menuOrder[i++]=MNU_SECURE2_R9MIN;
+      //menuOrder[i++]=MNU_SECURE2_R9MAX;
+   	break;
+	}
+   menuOrder[i]=MNU_LAST;
+
+}
+#define PAGE_SIZE 7
+const char * const title[7] = { "ALARM MENU", "MENU", "ADMIN MENU", "MAINTENANCE MENU", "CONFIG MENU", "LOGS MENU","SECURE TRANS MENU" };
+char lcd_ShowMenu(char menuLevel, char page)
+{  // returns if a next page is available
+	char i, j;
+   char rtnval;
+   int row, count, button;
+   char ttl;
+   rtnval=TRUE;
+
+   setupMenuOrder(menuLevel);
+   ttl = (menuLevel<7) ? menuLevel : 0;  // which title to show
+	lcd_drawScreen(2,title[ttl]);         // show the screen & title
+
+   // make sure we can handle the page size
+   if (page >= 1)
+   { 	i = page * PAGE_SIZE;
+   	// count backwards and reduce i if needed
+   	for (j=i; j>0; j--) if (menuOrder[j]==MNU_LAST) i=j-1;
+	} else i=0;
+
+   count=0;
+   lcd_Font("16B");
+   while ((menuOrder[i] != MNU_LAST) && (count < PAGE_SIZE))
+   {  row = 47 + count*30;
+   	// put up text
+	   //lcd_DispText(sys_message[menu[menuOrder[i]].msg1].msg, row, 50, MODE_TRANS);
+      // put up button
+	   lcd_ButtonDef( BTN_MNU_FIRST+menuOrder[i],  // menu items at 21+
+	      BTN_MOM,                      // momentary operation
+	      BTN_TLXY, 0, row,             // starting x,y for buttons
+		   BTN_TYPE, BUTTON_RELEASE,
+         BTN_MARGINS, 5, 315,
+	      BTN_TEXT, menu[menuOrder[i]].msg1,
+	      BTN_TXTOFFSET, 10, 6,
+	      BTN_BMP, BMP_long_button, BMP_long_button_dn,
+	      BTN_END );
+      i++;
+      count++;
+   }
+   // show page # at the bottom
+	j=0; while (menuOrder[j] != MNU_LAST) j++;
+   count = ((j-1) / PAGE_SIZE) + 1;
+	lcd_showPage(page+1, count);
+
+   // is there another page to show?
+   //if ( (menuOrder[i] == MNU_LAST) || (menuOrder[i+1] == MNU_LAST) ) rtnval=FALSE;
+   if ( (menuOrder[i] == MNU_LAST) ) rtnval=FALSE;
+   return rtnval;
+
+}
+char lcd_ProcessMenuItem(char menu_idx, char *menu_level)
+{  // can modify menu_level using advanced configuration menu item
+   // returns true if a flash parameter changed
+   unsigned long clock_in_seconds;
+   char work;
+   char maxDigits;
+   unsigned long temp_ulong;
+   static char parChanged;
+   parChanged=FALSE;  // assume not
+
+   switch (menu[menu_idx].partype)
+   {
+   case MNU_VAL:
+   	//lcd_drawScreen(4);sys_message[menu[menuOrder[i]].msg1].msg
+      if (menu[menu_idx].max > 999)
+      {  // unsigned long data type
+	      maxDigits = 9;  // 9 digits max
+	      temp_ulong = *(unsigned long*)menu[menu_idx].parval; // type is ulong
+      }
+      else
+      {  // character data type
+	      maxDigits = 3;  // only 3 digits max
+	      temp_ulong = *menu[menu_idx].parval;  // type is character
+      }
+      if (lcd_GetNumberEntry(menu[menu_idx].msg1, &temp_ulong,
+             menu[menu_idx].min, menu[menu_idx].max, menu[menu_idx].units, maxDigits, 0))
+      {
+      	if (menu[menu_idx].max > 999)  // cast unsigned long
+         	*(unsigned long*)menu[menu_idx].parval = temp_ulong;
+			else                           // cast character
+         	*menu[menu_idx].parval = (char)temp_ulong;
+         parChanged=TRUE;
+      }
+		break;
+   case MNU_FLAG:
+		parChanged=lcd_SelectChoice(menu[menu_idx].parval, menu[menu_idx].msg1, "YES", "NO");
+      // Some flags don't require parameters to be saved (when max=0);
+      if (menu[menu_idx].max == 0) parChanged=0; // Don't save parameter change to flash
+      //if (menu[menu_idx].item == MNU_ALARM_SOUND) alarm(ON); // update alarm if needed
+      break;
+   case MNU_OTHR:
+      switch (menu[menu_idx].item)
+      {
+      case MNU_ADMIN_FEATURES:
+      	// get pin for next menu level
+         if (lcd_enableAdvancedFeatures(2, menu[menu_idx].msg1)) *menu_level=2;
+         break;
+      case MNU_MAINT_FEATURES:
+      	// get pin for next menu level
+         if (lcd_enableAdvancedFeatures(3, menu[menu_idx].msg1)) *menu_level=3;
+         break;
+      case MNU_SYSTEM_CONFIG:
+      	// get pin for next menu level
+         if (lcd_enableAdvancedFeatures(4, menu[menu_idx].msg1)) *menu_level=4;
+         break;
+      case MNU_VIEW_LOGS:
+         *menu_level=5;  // Logs menu items
+         break;
+      case MNU_DEF_STATIONS:        // define active stations
+         //parChanged=lcd_defineActiveStations();
+         break;
+      case MNU_SETPASSWORD:        // set new password
+         // get the PIN for the given menu level
+         //if (*menu_level==2) parChanged |= lcd_getPin(param.adminPassword, "SET ADMIN PASSWORD");
+         //else if (*menu_level==3) parChanged |= lcd_getPin(param.maintPassword, "SET MAINT PASSWORD");
+         //else if (*menu_level==4) parChanged |= lcd_getPin(param.cfgPassword, "SET CONFIG PASSWORD");
+         break;
+      case MNU_CLEARPASSWORDS:    // reset passwords
+      	///param.adminPassword[0]=0;
+         ///param.maintPassword[0]=0;
+         parChanged=TRUE;
+         break;
+      case MNU_COMM_STAT:
+         //show_comm_test(1); // wait for button press
+         break;
+      case MNU_VIEW_SLOG:
+	      lcd_showTransSummary();
+         break;
+      case MNU_VIEW_TLOG:
+         lcd_showTransactions(0);
+      	break;
+      case MNU_VIEW_ALOG:
+         lcd_showTransactions(1);
+      	break;
+      case MNU_SHOW_IPADDR:
+      	//show_ip_address();
+      	break;
+      case MNU_SHOW_INPUTS:
+      	lcd_show_inputs();
+         break;
+      case MNU_RESET:
+         // go into long loop to allow watchdog reset
+         clock_in_seconds = SEC_TIMER;
+         lcd_drawScreen(3, menu[menu_idx].msg1);
+	      lcd_Font("24");
+	      lcd_DispText("SYSTEM RESTARTING", 5, 85, MODE_NORMAL);
+         #asm
+            ipset 3          ; disable interrupts so that the periodic ISR doesn't hit the watchdog.
+            ld a,0x53        ; set the WD timeout period to 250 ms
+            ioi ld (WDTCR),a
+         #endasm
+         while (SEC_TIMER - clock_in_seconds < 5);
+	      lcd_DispText("UNABLE TO RESET", 50, 115, MODE_NORMAL);
+         msDelay(1000);
+         break;
+      }
+	}
+   return parChanged;
+}
+/******************************************************************/
+char lcd_GetNumberEntry(char *description, unsigned long * par_value,
+         unsigned long par_min, unsigned long par_max, char * par_units, char max_digits, char nc_as_ok)
+{  // Allows numeric keypad entry using the touch screen
+   // return value is 0 = *no change or cancel or timeout
+   //                 1 = valid number entered and updated to par_value
+   //                 * no change returns 1 if nc_as_ok is true
+
+	int button;
+   char keepLooping;
+   unsigned long inval;
+   char number[11];  // for display of numeric text
+   char numDigits;
+   char rtnval;
+   int xref, yref;
+   char i;
+   inval=0;
+   keepLooping=TRUE;
+   numDigits=0;
+   rtnval=0;  // assume no good
+
+   // Initialize 60 second menu timeout
+   menu_timeout = SEC_TIMER + 60;
+
+   // draw screen with keypad
+   lcd_drawScreen(4, "ENTER VALUE");
+
+   // print title and place to print the number
+   xref=80; // x pos of input box
+   yref=76;
+   lcd_Font("18BC");
+   lcd_DispText(description, lcd_Center(description, 2)-20, 50, MODE_NORMAL); // hack position with -10
+	lcd_DispBitmap( BMP_input_box, xref, yref );
+   lcd_DispText(par_units, xref+67, yref+8, MODE_NORMAL);
+
+   // show actual, min and max
+   lcd_Font("16B");
+   lcd_DispText("Min = ", 20, 110, MODE_NORMAL);
+   lcd_DispText(ltoa((long)par_min, number), 0, 0, MODE_NORMAL);
+   lcd_DispText("; Current = ", 0, 0, MODE_NORMAL);
+   lcd_DispText(ltoa((long)*par_value, number), 0, 0, MODE_NORMAL);
+   lcd_DispText("; Max = ", 0, 0, MODE_NORMAL);
+   lcd_DispText(ltoa((long)par_max, number), 0, 0, MODE_NORMAL);
+   // Setup for first character to display
+	number[0]=0; number[1]=0;
+
+   while ( (keepLooping) && !secTimeout(menu_timeout) )
+   {
+      maintenance();  // watchdog, led activity, UDP commands
+      button = lcd_GetTouch(100);
+      if (button != -1)
+      {  // valid button pressed
+      	menu_timeout = SEC_TIMER + 60;
+	      if ((button >= '0') && (button <= '9') && (numDigits < max_digits))
+         {  // add the digit to the string
+         	number[numDigits]=button;
+         	numDigits++;
+         	number[numDigits]=0;  // trailing null
+				lcd_DispText(number, xref+5, yref+7, MODE_TRANS); // show the number
+	      } else if ((button == BTN_DEL) && (numDigits > 0))
+         {  numDigits--;
+         	number[numDigits]=0;  // trailing null
+            // reprint the screen
+	         lcd_DispBitmap( BMP_input_box, xref, 80 );
+	         lcd_DispText(number, xref+5, yref+7, MODE_TRANS); // show the number
+	      } else if (button == BTN_CANCEL)
+	      {  keepLooping=FALSE;
+	      } else if (button == BTN_OK)
+	      {  // was anything entered?
+         	if (numDigits==0)
+            { // no entry
+            	if (nc_as_ok)
+               {  // return nc as ok
+                  rtnval=1;
+               }
+	            else
+               {  lcd_DispText("NO CHANGE MADE", 65, 265, MODE_REV);
+                  msDelay(750);
+               }
+               keepLooping=FALSE;
+            } else
+            {
+	            inval = (unsigned long)atol(number);
+	            if ((inval >= par_min) && (inval <= par_max))
+	            {  keepLooping=FALSE;
+	               *par_value = inval;
+	               rtnval=1;
+	            } else
+	            { lcd_DispText("OUTSIDE RANGE", 65, 265, MODE_REV);
+	              msDelay(750);
+	              numDigits=0;
+	              number[0]=0; number[1]=0;
+	              lcd_DispBitmap( BMP_input_box, xref, yref );
+	              lcd_DispText(number, xref+5, yref+7, MODE_TRANS); // show the number
+               }
+            }
+         }
+      }
+   }
+   return rtnval;
+}
+void lcd_enterSetupMode(char operatorLevel)
+{
+	int button;
+   char mych;
+   char keepLooping;
+   char menu_idx;
+   char page;
+   char anotherPage;
+   char showPage;
+   char newLevel;
+   char changed;
+   keepLooping=TRUE;
+   page=0;
+   changed=FALSE; // None yet
+
+   // clear the button input buffer
+   lcd_GetTouch(1);
+
+	anotherPage = lcd_ShowMenu(operatorLevel, page);
+   // Initialize 60 second menu timeout
+   menu_timeout = SEC_TIMER + 60;
+
+   while ( (keepLooping) && !secTimeout(menu_timeout) )
+   {
+      maintenance();  // watchdog, led activity, UDP commands
+      // inKey = getKey();
+      showPage=FALSE;
+      button = lcd_GetTouch(100);
+      if (button != -1)
+      {  // valid button pressed
+      	menu_timeout = SEC_TIMER + 60;
+	      if ((button >= BTN_MNU_FIRST) && (button <= BTN_MNU_FIRST+MNU_LAST))
+	      {  menu_idx = button-BTN_MNU_FIRST;
+         	newLevel = operatorLevel;
+	         changed |= lcd_ProcessMenuItem(menu_idx, &newLevel);
+            // Did we advance to a new menu
+            if (newLevel != operatorLevel)
+            { operatorLevel = newLevel;
+              page=0;
+            }
+            // continue to show menu?
+            if (operatorLevel==99) keepLooping=FALSE;
+            // update display of menu items?
+            if (!secTimeout(menu_timeout)) showPage=TRUE;
+	      }
+	      else if (button == BTN_PREV)
+	      {  if (page>0) { page--; showPage=TRUE;}
+	      }
+	      else if (button == BTN_NEXT)
+	      {  if (anotherPage) { page++; showPage=TRUE;}
+	      }
+	      //else if (button == BTN_SAVE)
+	      else if (button == BTN_CANCEL)  // DONE
+         {
+         	if (changed)
+            {  // save changes if needed
+	            lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+	            lcd_ClearScreen ();
+	            lcd_Origin( 0, 0 );
+	            lcd_Font("24");
+	            lcd_DispText("SAVING CHANGES ...", 10, 50, MODE_NORMAL);
+	            if (writeParameterSettings() == 0)
+	               lcd_DispText("\nCHANGES SAVED", 0, 0, MODE_NORMAL);
+	            else
+	               lcd_DispText("\nERROR SAVING CHANGES", 0, 0, MODE_REV);
+	            msDelay(800);
+               //sendParametersToLogger(); // send parameters to data logger
+            }
+         	keepLooping = FALSE;
+         }
+	      //else if (button == BTN_CANCEL) keepLooping = FALSE;
+
+         // show the same or next menu page if needed
+         if (showPage && keepLooping) anotherPage = lcd_ShowMenu(operatorLevel, page);
+      }
+
+	}
+
+}
+nodebug char lcd_enableAdvancedFeatures(char menu_level, char * description)
+{  // get password for the requested level
+	char reqdPW[5];
+   char altPW[5];  // for non-settable cfg (Colombo) PW
+   char enteredPW[5];
+   char rtnVal;
+
+   strcpy(altPW, "xxxx");  // start with pin that can't be entered
+
+   // determine which password to compare with
+   switch (menu_level)
+   {
+//   case 2: 	strcpy(reqdPW, param.adminPassword); break;
+//   case 3: 	strcpy(reqdPW, param.maintPassword); break;
+//   case 4: 	strcpy(reqdPW, param.cfgPassword);
+   default: reqdPW[0]=0;
+   }
+	strcpy(altPW, "2321");  // 2321 is always available
+
+	rtnVal=FALSE;  // assume no good
+   if (strlen(reqdPW)==0) rtnVal=TRUE;
+   else
+   {  // get the password/pin
+   	if (lcd_getPin(enteredPW, description))
+      {  // allow entry of settable or alternate/fixed pin
+      	if ( (strcmp(enteredPW, reqdPW)==0) || (strcmp(enteredPW, altPW)==0) ) rtnVal=TRUE;
+         else
+         {  // sorry charlie
+				lcd_BFcolorsB( lcd_WHITE, lcd_RED);
+			   lcd_Font("24");
+			   lcd_DispText(" INCORRECT PIN ", 17, 160, MODE_NORMAL);
+            msDelay(2000);
+         }
+      }
+   }
+   return rtnVal;
+}
+nodebug char lcd_getPin(char *PIN, char *description)
+{  // get a 4 digit pin from the touch screen
+	int button;
+   char keepLooping;
+   char number[5];  // for storing entered digits
+   char asteric[5]; // for display on screen
+   char numDigits, maxDigits;
+   char rtnval;
+   char i;
+   keepLooping=TRUE;
+   numDigits=0;
+   maxDigits=4;
+   rtnval=0;  // assume no good
+
+   // Initialize 60 second menu timeout
+   menu_timeout = SEC_TIMER + 60;
+
+   // draw screen with keypad
+   lcd_drawScreen(4, description);
+
+   // print title and place to print the number
+   lcd_Font("18BC");
+   lcd_DispText("ENTER 4 DIGIT PIN", 20, 50, MODE_NORMAL);
+	lcd_DispBitmap( BMP_input_box, 45, 80 );
+
+   // show actual, min and max
+   lcd_Font("32B");
+   // Setup for first character to display
+	number[0]=0; number[1]=0;
+   asteric[0]=0; asteric[1]=0;
+
+   while ( (keepLooping) && !secTimeout(menu_timeout) )
+   {
+      maintenance();  // watchdog, led activity, UDP commands
+      button = lcd_GetTouch(100);
+      if (button != -1)
+      {  // valid button pressed
+      	menu_timeout = SEC_TIMER + 60;
+	      if ((button >= '0') && (button <= '9') && (numDigits < maxDigits))
+         {  // add the digit to the string
+         	number[numDigits]=button;
+            asteric[numDigits]='*';
+         	numDigits++;
+         	number[numDigits]=0;  // trailing null
+            asteric[numDigits]=0;
+				lcd_DispText(asteric, 50, 87, MODE_TRANS); // show the number
+	      } else if ((button == BTN_DEL) && (numDigits > 0))
+         {  numDigits--;
+         	number[numDigits]=0;  // trailing null
+            asteric[numDigits]=0;
+            // reprint the screen
+	         lcd_DispBitmap( BMP_input_box, 45, 80 );
+	         lcd_DispText(asteric, 50, 87, MODE_TRANS); // show the number
+	      } else if (button == BTN_CANCEL)
+	      {  keepLooping=FALSE;
+	      } else if (button == BTN_OK)
+	      {  strcpy(PIN, number);
+         	keepLooping=FALSE;
+            rtnval=1;
+         }
+      }
+   }
+   return rtnval;
+
+}
+void lcd_show_inputs()
+{
+   // shows digital inputs on-screen for diagnosis
+   char done;
+   char i, j, col, msgbuf[25];
+   char inKey;
+   int button;
+
+	lcd_drawScreen(5, "SHOW INPUTS");
+
+   //strcpy(msgbuf, sys_message[MSG_BLANK].msg);  // buffer to show stations
+
+   done=FALSE;
+   // Loop until done or timeout
+	while ((done==FALSE) && !secTimeout(menu_timeout))
+   {
+		maintenance();  // watchdog, led activity, UDP commands
+	   menu_timeout = SEC_TIMER + 60; // never timeout like this
+	   button = lcd_GetTouch(100);
+
+	   // If BTN_SAVE, save changes
+	   if (button == BTN_EXIT)  // Exit button
+	   {
+         done=TRUE;
+      }
+	   lcd_DispText("Arrival: ", 20, 50, MODE_NORMAL);
+      lcd_DispText(di_carrierArrival ? "ON  " : "OFF", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nIn Chamber: ", 0, 0, MODE_NORMAL);
+      lcd_DispText(di_carrierInChamber ? "ON  " : "OFF", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nDoor: ", 0, 0, MODE_NORMAL);
+      lcd_DispText(di_doorClosed ? "ON  " : "OFF", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nSend Button: ", 0, 0, MODE_NORMAL);
+	   sprintf(msgbuf, "%X  ", di_requestToSend);
+      lcd_DispText(msgbuf, 0, 0, MODE_NORMAL);
+      lcd_DispText("\nDiverter Pos: ", 0, 0, MODE_NORMAL);
+	   //sprintf(msgbuf, "%X  ", di_diverterPos);
+      //lcd_DispText(msgbuf, 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nRaw Inputs: ", 0, 0, MODE_NORMAL);
+      strcpy(msgbuf,""); // blank out
+      j=readDigBank(0);
+		for (i=0; i<8; i++) strcat(msgbuf, (j & 1<<i) ? "1" : "0");
+      strcat(msgbuf, " ");
+      j=readDigBank(1);
+		for (i=0; i<8; i++) strcat(msgbuf, (j & 1<<i) ? "1" : "0");
+      lcd_DispText(msgbuf, 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nIP address: ",0,0,MODE_NORMAL);
+	   lcd_DispText(myIPaddress,0,0,MODE_NORMAL);
+   }
+
+}
+void lcd_ShowKeypad(char opts)
+{  // display 0..9 in a keypad arrangement on the screen
+   // opts = 0 = no '-' button
+   //        1 = use '-' button
+	char i;
+   char btn[2];
+
+   i=1; // first digit 1
+   btn[0]=49;
+   btn[1]=0;
+
+   // draw first button
+   lcd_Font("16B");
+   lcd_ButtonDef( '0'+i,
+      BTN_MOM,                      // momentary operation
+      BTN_TLXY, 70, 127,               // starting x,y for buttons
+      BTN_TYPE, BUTTON_RELEASE,
+      BTN_MARGINS, 70, 140,        // set left and right margins
+      BTN_SEP, 35, 33,              // set up for button sep
+      BTN_TEXT, btn,
+      BTN_TXTOFFSET, 11, 9,
+      BTN_BMP, BMP_button_up, BMP_button_dn,
+      BTN_END );
+   // draw 2-9
+   for (i=2; i<10; i++)
+   {  btn[0]++;
+	   lcd_ButtonDef( '0'+i,
+	      BTN_TEXT, btn,
+	      BTN_END );
+	}
+   // draw last buttons
+   if (opts==1) // use '-' button
+   {  i='-';
+      btn[0]='-';
+	   lcd_ButtonDef( i,
+	      BTN_TEXT, btn,
+	      BTN_END );
+   }
+   // draw '0'
+   i=0;
+   btn[0]=48;
+   lcd_ButtonDef( '0'+i,
+      BTN_TEXT, btn,
+      BTN_END );
+   // draw 'Del'
+   lcd_ButtonDef( BTN_DEL,
+      BTN_TXTOFFSET, 5, 9,
+   	BTN_TEXT, "Del",
+      BTN_END );
+
+}
+void lcd_showPage(long thisPage, long lastPage)
+{  // show page x of y
+   char buf[25];
+return;
+   sprintf(buf, "Page %ld of %ld  ", thisPage, lastPage);
+   lcd_Font("6x9");
+   lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+   lcd_DispText(buf, 145, 218, MODE_NORMAL);
+}
+int lcd_SelectChoice(char *choice, char *label, char *optZero, char *optOne)
+{
+	// Show label and two choices and allow selection
+   // choice is modified as TRUE (optZero) or FALSE (optOne) based on selection
+   // function returns 0 if cancel or 1 if a choice is made
+
+   int button;
+
+	lcd_drawScreen(3, "MENU");
+   lcd_Font("24");
+   lcd_DispText(label, lcd_Center(label, 1), 50, MODE_NORMAL);
+   lcd_DispText(optZero, 150, 85, MODE_NORMAL);
+   lcd_DispText(optOne, 150, 115, MODE_NORMAL);
+
+   // show optZero choice
+   lcd_ButtonDef( BTN_YES_ON,
+   BTN_LAT,                      // latching operation
+   BTN_TLXY, 110, 80,             // starting x,y for buttons
+   BTN_TYPE, (*choice) ? BUTTON_LAT_1 : BUTTON_LAT_0,
+   BTN_BMP, BMP_check_box, BMP_check_box_click,
+   BTN_END );
+   // show optOne choice
+   lcd_ButtonDef( BTN_NO_OFF,
+   BTN_TLXY, 110, 110,             // starting x,y for buttons
+   BTN_TYPE, (*choice) ? BUTTON_LAT_0 : BUTTON_LAT_1,
+   BTN_BMP, BMP_check_box, BMP_check_box_click,
+   BTN_END );
+   // show Cancel button
+   lcd_Font("16B");
+   lcd_ButtonDef( BTN_CANCEL,
+      BTN_MOM,                      // momentary operation
+      BTN_TLXY, 257, 205,             // starting x,y for buttons
+      BTN_TYPE, BUTTON_RELEASE,
+      BTN_TEXT, "Cancel",
+      BTN_TXTOFFSET, 5, 9,
+      BTN_BMP, BMP_med_button, BMP_med_button_dn,
+      BTN_END );
+
+   // wait for button press & release
+   menu_timeout = SEC_TIMER + 60;
+	while( ((button = lcd_GetTouch(100)) == -1) && !secTimeout(menu_timeout) )
+   	maintenance();
+
+   // handle selection
+   if (button == 256+BTN_NO_OFF)
+   {  // update screen
+      *choice=FALSE;
+   }
+   else if (button == 256+BTN_YES_ON)
+   {  // update screen
+      *choice=TRUE;
+   }
+	if ((button == BTN_CANCEL) || (button == -1)) return 0; // cancel or timeout
+   else
+   {  // update scren to show choice
+	   lcd_ButtonDef( BTN_YES_ON,
+	   BTN_LAT,                      // latching operation
+	   BTN_TLXY, 110, 80,             // starting x,y for buttons
+	   BTN_TYPE, *choice ? BUTTON_LAT_1 : BUTTON_LAT_0,
+	   BTN_BMP, BMP_check_box, BMP_check_box_click,
+	   BTN_END );
+	   // show optZero choice
+	   lcd_ButtonDef( BTN_NO_OFF,
+	   BTN_TLXY, 110, 110,             // starting x,y for buttons
+	   BTN_TYPE, *choice ? BUTTON_LAT_0 : BUTTON_LAT_1,
+	   BTN_BMP, BMP_check_box, BMP_check_box_click,
+	   BTN_END );
+	   msDelay(500); // wait so you can see the choice
+   	return 1;  // got a choice
+   }
+}
+void lcd_helpScreen(char view)
+{  // view 0 - main screen help
+	//      1 - log screen help
+	int button;
+
+   // Logo splash screen
+	lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+	lcd_ClearScreen ();
+   lcd_Font("13");
+// lcd_DispText(param.station_name[SYSTEM_NAME].name, 10, 5, MODE_NORMAL);
+	lcd_DispText("Remote Station - ", 10, 5, MODE_NORMAL);
+   lcd_DispText(FIRMWARE_VERSION, 0, 0, MODE_NORMAL);
+
+   if (view==0)
+   {  // main screen help
+	   lcd_DispText("\nTo send a carrier:", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nInsert carrier into tube and close the door", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nTouch the send button send it", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nTouch the Menu button for system features", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nHelp Phone Numbers", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nSystem Administrator: ", 0, 0, MODE_NORMAL);
+	//   lcd_DispText(param.phoneNum[ADMIN_PHONE], 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nMaintenance: ", 0, 0, MODE_NORMAL);
+	//   lcd_DispText(param.phoneNum[MAINT_PHONE], 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nColombo Pneumatic Tube Systems:\n800-547-2820", 0, 0, MODE_NORMAL);
+	} else if (view==1)
+   {  // log screen help
+	   lcd_DispText("\nDATE TIME of event start", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nDUR is duration in seconds", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nDIR is direction", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nSTATUS codes", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 0 = normal status", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 1 = diverter timeout", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 2 = carrier exit (lift) timeout", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 3 = delivery overdue timeout", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 4 = blower timeout", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 5 = station not ready or cancel dispatch", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 6 = transaction cancelled/aborted", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n 64 = Door opened event", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\nFLAGS (hexidecimal)", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n xxxx xxx1 = Stat Transaction", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n xxxx xx1x = Carrier return function", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n xxxx x1xx = Auto return activated", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n xxxx 1xxx = Door opened in transaction", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n xxx1 xxxx = Auto return performed", 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n xx1x xxxx = Secure transaction", 0, 0, MODE_NORMAL);
+   }
+   // done button
+	lcd_Font("16B");
+   lcd_ButtonDef( BTN_CANCEL,
+	   BTN_MOM,                      // momentary operation
+      BTN_TYPE, BUTTON_RELEASE,
+      BTN_MARGINS, 5, 330,         // set left and right margins
+      BTN_SEP, 63, 43,              // set up for button sep
+	   BTN_TXTOFFSET, 10, 9,
+	   BTN_TLXY, 170, 285,             // starting x,y for buttons
+	   BTN_TEXT, "Done",
+	   BTN_BMP, BMP_med_button, BMP_med_button_dn,
+	   BTN_END );
+
+   // wait for a button press
+   menu_timeout = SEC_TIMER + 60;
+   while(((button=lcd_GetTouch(100)) == -1) && !secTimeout(menu_timeout) ) maintenance();
+
+}
+struct logInfoType
+{  char spare[4]; 	     	// available open space for data
+   unsigned long xSF_Head; 	// Not used
+   unsigned long xSF_Tail;    // Not used
+	unsigned long Head;  	// points to latest entry
+	unsigned long Tail;  	// points to first entry  (if both equal 0 then log is empty)
+	char Ver;
+   char spare2;         	// available open space for data
+} logInfo;
+unsigned long logInfoXaddr;  // address to xmem for logInfo
+unsigned long logXaddr;      // address to xmem for data log
+int SFAvailable;				  // Indicates if serial flash is available
+#define XMemLogMax 100
+#define SFLogMax 500000
+long MaxLogEntries;   		// maximum number of events in either log
+#define LOG_VERSION   3
+xmem void initTransLog(void)
+{
+	struct trans_log_type trans;
+   int status;
+   int sf;
+	long memOffset;
+   char sbuf[80];
+
+	// allocate the xmem for header and log
+   logInfoXaddr = xalloc(sizeof(logInfo));  // was 10, added 12 more (size of trans)
+   logXaddr = xalloc(XMemLogMax * sizeof(trans));
+
+	lcd_Font("16");
+   // check for and init the serial flash (only in run mode)
+   //// NO SF IN REMOTE: if (OPMODE == 0x80) sf = SF1000Init(); else sf = -3;
+   	sf=-3; // FORCE UNUSED
+   if (sf==0) // will use SF instead of XMEM
+   {	SFAvailable=TRUE;
+   	MaxLogEntries=SFLogMax;
+      lcd_DispText("Using Serial Flash for event log",0,0,MODE_NORMAL);
+   } else
+   {  SFAvailable=FALSE;
+   	MaxLogEntries=XMemLogMax;
+      lcd_DispText("Using xmem for event log",0,0,MODE_NORMAL);
+   }
+
+   // get the header to determine head and tail
+   status = xmem2root( &logInfo, logInfoXaddr, sizeof(logInfo));
+
+   if (status != 0)
+   {  // error reading xmem
+   	sprintf(sbuf,"\nError %d initializing transaction log", status);
+      lcd_DispText(sbuf,0,0,MODE_NORMAL);
+   	//printf("\nError %d initializing transaction log", status);
+   }
+	// if log version does not match then initialize log
+   if (logInfo.Ver != LOG_VERSION)
+   {  // reinit log
+   	// start over from scratch
+      logInfo.Tail=0;
+      logInfo.Head=0;
+      lcd_DispText("\nTransaction log reset\n",0,0,MODE_NORMAL);
+      //printf("\nTransaction log reset\n");
+
+      // save the logInfo data
+      logInfo.Ver = LOG_VERSION;
+      root2xmem( logInfoXaddr, &logInfo, sizeof(logInfo));
+	}
+   // make sure head/tail are plausible
+   // either tail=0 and head=0..MaxLogEntries-1
+   // or tail=1..MaxLogEntries-1 and head=tail-1
+   else if ((logInfo.Tail<=logInfo.Head) && (logInfo.Head<MaxLogEntries))
+   { // OK
+   	sprintf(sbuf, "\nTrans log contains %ld entries\n", logInfo.Head-logInfo.Tail);
+      lcd_DispText(sbuf,0,0,MODE_NORMAL);
+   }
+   else if ((logInfo.Tail>logInfo.Head) && (logInfo.Tail<MaxLogEntries))
+   { // OK
+      sprintf(sbuf, "\nTrans log contains %ld entries\n", logInfo.Head + (MaxLogEntries-logInfo.Tail));
+      lcd_DispText(sbuf,0,0,MODE_NORMAL);
+   }
+   else
+   { // NOT OK so reinitialize head and tail
+      sprintf(sbuf,"\nTrans log reset due to inconsistent tail: %ld and head: %ld\n", logInfo.Tail, logInfo.Head);
+      lcd_DispText(sbuf,0,0,MODE_NORMAL);
+   	logInfo.Tail=0;
+      logInfo.Head=0;
+      root2xmem( logInfoXaddr, &logInfo, sizeof(logInfo));
+   }
+}
+void analyzeEventLog()
+{  // Check consistency of entries in the log and reset tail/head if needed
+	// Valid entries have a date/time between 850,000,000 (Dec-2006) and current date/time (+ 1 month)
+   // In case of log wrap-around, the date/time of a previous valid entry is greater than the next valid entry
+	unsigned long lastTransDateTime;
+   unsigned long newTail;
+   unsigned long newHead;
+   unsigned long savedTail;
+   struct trans_log_type trans;
+   long entry;
+   int button;
+   int foundStart;
+   char myline[80];     // line to send to the lcd
+   lastTransDateTime=0;
+   entry=0;
+   newTail=0;  // assume for now it will be at the start
+   newHead=0;
+	savedTail=logInfo.Tail;
+
+	lcd_drawScreen(5, "ANALYZE EVENT LOG");
+   lcd_Font("8x12");
+   lcd_DispText("Checking Log Consistency", 10, 50, MODE_NORMAL);
+   sprintf(myline, "\nCurrent first entry %ld", logInfo.Tail);
+	lcd_DispText(myline, 0, 0, MODE_NORMAL);
+   sprintf(myline, "\nCurrent last entry %ld", logInfo.Head);
+	lcd_DispText(myline, 0, 0, MODE_NORMAL);
+
+   logInfo.Tail=0;  // have to set tail to zero to get absolute entry references
+   foundStart=FALSE; // Not yet
+   while (entry < MaxLogEntries)
+   {  if (entry%100==0)
+   	{  // update progress
+      	sprintf(myline, "Checking Entry %ld", entry);
+			lcd_DispText(myline, 10, 110, MODE_NORMAL);
+         maintenance();
+		}
+
+   	getTransaction(entry, &trans);
+   	if ((trans.start_tm > 850000000) && (trans.start_tm < SEC_TIMER+2592000))
+      {  // good entry
+      	foundStart=TRUE;
+			// is it before or after last entry
+         if (trans.start_tm < lastTransDateTime)
+         {  // assume it is wrap around of the log
+         	newHead=entry-1;
+            newTail=entry;
+         }
+      	entry++;
+      }
+      else
+      {  // invalid entry
+         if (foundStart)
+      	{  // already found a good entry so stop now
+	         if (entry>0)newHead=entry;
+	         entry=MaxLogEntries+1;
+         }
+         else
+         {  // didn't find start yet so keep going
+         	entry++;
+            newTail=entry;  // Hope we find the start
+         }
+      }
+   }
+   logInfo.Tail=savedTail;  // reset saved tail
+   // show last entry checked
+   sprintf(myline, "Checking Entry %ld", MaxLogEntries);
+   lcd_DispText(myline, 10, 110, MODE_NORMAL);
+
+   // Show new head and tail and ask if it should be retained
+   sprintf(myline, "\nDetected first entry %ld", newTail);
+	lcd_DispText(myline, 0, 0, MODE_NORMAL);
+   sprintf(myline, "\nDetected last entry %ld", newHead);
+	lcd_DispText(myline, 0, 0, MODE_NORMAL);
+
+   // if it changed then ask if it should be kept
+   if ((logInfo.Tail != newTail) || (logInfo.Head != newHead))
+	{  lcd_DispText("\nAccept Detected Entries?", 0, 0, MODE_NORMAL);
+	   lcd_ButtonDef( BTN_CANCEL,
+	      BTN_TXTOFFSET, 9, 9,
+         BTN_TLXY, 5, 205,             // starting x,y for buttons
+         BTN_TEXT, "Accept",
+         BTN_END );
+	}
+   else {lcd_DispText("\nEntries are consistent", 0, 0, MODE_NORMAL);}
+
+   // wait for any button
+   menu_timeout = SEC_TIMER + 60;
+   while(((button=lcd_GetTouch(100)) == -1) && !secTimeout(menu_timeout) ) maintenance();
+
+   // Was Accept button pressed
+   if (button==BTN_CANCEL)
+   {	// keep the new entries
+   	logInfo.Tail = newTail;
+      logInfo.Head = newHead;
+
+	   // save head/tail back to xmem
+	   root2xmem( logInfoXaddr, &logInfo, sizeof(logInfo));
+   }
+}
+
+// TEMPORARY REMOVE UNTIL CARD SCANNING IS NEEDED
+/*
+void addSecureTransaction(struct secure_log_type secTrans)
+{  // map secure trans data into trans log and save
+   // also works for standard card scans
+	struct trans_log_type trans;
+   char extra; // used for station #
+   trans.trans_num = secTrans.trans_num;
+   trans.start_tm = secTrans.start_tm;
+   trans.duration = (secTrans.sid[1] << 8) + secTrans.sid[0];
+   trans.source_sta = secTrans.sid[2];
+   trans.dest_sta = secTrans.sid[3];
+   trans.status = secTrans.status;
+   trans.flags = secTrans.sid[4];
+   extra = secTrans.flags;  // contains the station #
+
+   if (secTrans.scanType == 2)
+   {  trans.status = ESTS_CARD_SCAN;
+   	trans.trans_num = transactionCount(); // maybe just temporary
+		sendUDPtransaction(trans, extra);  // just send, don't log
+   }
+   else if (secTrans.scanType == 3)
+   {  trans.status = ESTS_UNAUTH_CARD;
+   	trans.trans_num = transactionCount(); // maybe just temporary
+		sendUDPtransaction(trans, extra);  // just send, don't log
+   }
+   else addTransaction(trans, extra); // add to log and send
+
+
+}
+*/
+void addTransaction(struct trans_log_type trans, char xtra)
+{
+	long memOffset;
+   int sf;
+   // Push the transaction into local xmem
+   memOffset = logInfo.Head * sizeof(trans);
+
+//   if (SFAvailable)
+//   {  // write to serial flash
+//	  	while ( (sf=SF1000Write ( memOffset, &trans, sizeof(trans) )) == -3 );
+//   }
+//   else
+//   {  // write to xmem
+   	root2xmem( logXaddr+memOffset, &trans, sizeof(trans));
+      sf=0;
+//   }
+	if (sf==0)  // did we save ok?
+	{
+	   // update the log pointers
+	   logInfo.Head++; // increment logHead
+	   if (logInfo.Head==MaxLogEntries) logInfo.Head=0;  // check for wraparound
+	   if (logInfo.Head==logInfo.Tail)                    // check for full log
+	   {  logInfo.Tail++;                           // bump the tail
+	      if (logInfo.Tail==MaxLogEntries) logInfo.Tail=0;   // check for wraparound
+	   }
+   }
+
+   // save head/tail back to xmem
+   root2xmem( logInfoXaddr, &logInfo, sizeof(logInfo));
+printf("\nAdded transaction at %ld with status %d and flags %d\n", SEC_TIMER, (int)trans.status, (int)trans.flags);
+
+   // now send out the UDP message
+//   sendUDPtransaction( trans, xtra );
+
+}
+long sizeOfTransLog(void)
+{  // how many entries in the log
+   if ((logInfo.Tail<=logInfo.Head) && (logInfo.Head<MaxLogEntries))
+   { // OK
+   	return logInfo.Head-logInfo.Tail;
+   }
+   else if ((logInfo.Tail>logInfo.Head) && (logInfo.Tail<MaxLogEntries))
+   { // OK, head before tail
+      return logInfo.Head + (MaxLogEntries-logInfo.Tail);
+   }
+   else return 0;
+}
+int getTransaction(long entry, struct trans_log_type *trans)
+{  // returns the n'th entry in the trans log (flash or xmem)
+   // entry can be 0 .. sizeOfLog-1
+   // return value = 0 if success or 1 if entry non-existant
+   long memOffset;
+   if (entry >= MaxLogEntries) return 1;
+   memOffset = ((logInfo.Tail+entry) % MaxLogEntries) * sizeof(*trans);
+//   if (SFAvailable) SF1000Read ( memOffset, trans, sizeof(*trans));
+//   else xmem2root( trans, logXaddr+memOffset, sizeof(*trans));
+	xmem2root( trans, logXaddr+memOffset, sizeof(*trans));
+   if (entry >= sizeOfTransLog()) return 1;
+   else return 0;
+}
+long findTransaction(unsigned long transNum)
+{  // search the trans log for first trans equal to transNum
+   // and return the position in the log as entry
+   // if not found will return 0
+   long entry;
+   struct trans_log_type log;
+   int found;
+
+   entry = sizeOfTransLog();
+   found = 0;
+   while ((entry > 0) && (found == 0))
+   {  // loop backwards to find transNum
+      getTransaction(entry, &log);
+      if (log.trans_num < transNum)
+      {  // found one lower, so return entry+1
+         found=1;
+         entry++;
+      }
+      else
+      {  // didn't find it yet, go back one more
+      	entry--;
+      }
+   }
+   // either way, return entry
+	return entry;
+}
+#define TRANS_PER_PAGE 14
+void lcd_showTransactions(char format)
+{  // shows the transaction log on the screen
+   // format = 1 = only show alarms
+   long page;
+   long lastPage;
+   int button;
+   int transPerPage;
+
+   // count how many pages we can show
+   page=0;
+   lastPage = sizeOfTransLog() / TRANS_PER_PAGE;
+   if (format==1) lastPage = 0;
+
+   lcd_drawScreen(8, "TRANSACTION LOG");		// redraw main screen
+	lcd_showTransPage(page, lastPage, format);
+
+	button=0;
+   while ((button != BTN_CANCEL) && !secTimeout(menu_timeout))
+   {  maintenance();
+   	button = lcd_GetTouch(100);
+      if (button != -1)
+      {  // valid button pressed
+         menu_timeout = SEC_TIMER + 60;
+         switch( button )
+         {
+         case BTN_PREV:
+         	if (page > 0) page--; else page=lastPage;  // allow wraparound
+            lcd_showTransPage(page, lastPage, format);
+         	break;
+         case BTN_NEXT:
+            if (page < lastPage) page++; else page=0;  // allow wraparound
+            lcd_showTransPage(page, lastPage, format);
+         	break;
+         case BTN_HELP:
+	      	lcd_helpScreen(1);
+			   lcd_drawScreen(8, "TRANSACTION LOG");		// redraw main screen
+            lcd_showTransPage(page, lastPage, format);
+         	break;
+         }
+      }
+   }
+}
+
+void lcd_showTransPage(long page, long lastPage, char format)
+{	// page 0 shows the last transaction
+	int x;
+	int y, dy;
+   long entry;
+   char j;
+   char buf[80];
+   char UID[UIDLen];
+   char UIDstr[13];
+   struct trans_log_type trans;
+   struct tm time;
+
+   //strcpy(buf, "mm/dd/yy hh:mm:ss sourcesta.. -> destinsta.. sss sec");
+   entry = sizeOfTransLog() -1 - page * TRANS_PER_PAGE;
+   j=0;
+   y=44; dy=14; x=5;
+   lcd_Font("6x9");
+   // print header
+   sprintf(buf, "DATE     TIME     DUR DIR STATUS FLAGS");
+   lcd_DispText(buf, x, y, MODE_NORMAL);
+   y+=dy;
+
+   while ( (j < TRANS_PER_PAGE) && (entry >= 0) ) //< sizeOfTransLog()))
+   {
+		if (getTransaction(entry, &trans) == 0)
+      {  mktm(&time, trans.start_tm);
+      	lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+      	if (trans.status <= LAST_TRANS_EVENT)
+         {  // This is a transaction
+	         sprintf(buf, "%02d/%02d/%02d %02d:%02d:%02d %3d %-3s  %2x     %2x",
+	            time.tm_mon, time.tm_mday, time.tm_year%100, time.tm_hour, time.tm_min, time.tm_sec,
+//	            trans.source_sta < SYSTEM_NAME ? param.station_name[trans.source_sta].name : "??",
+//	            trans.dest_sta < SYSTEM_NAME ? param.station_name[trans.dest_sta].name : "??",
+	            trans.duration,
+               trans.source_sta == DIR_SEND ? "RCV" : "SND",
+	            (int) trans.status, (int) trans.flags );
+            if (trans.status != 0)  			 lcd_BFcolorsB( lcd_RED, lcd_WHITE);  // alarm trans colors
+	         else if (trans.flags & (FLAG_STAT | FLAG_SECURE)) lcd_BFcolorsD( 0xAA0, 0xFFF); //lcd_BFcolorsB( lcd_YELLOW, lcd_WHITE);  // stat trans colors
+            else if (trans.flags & (FLAG_CRETURN | FLAG_ARETURN | FLAG_ARETURNING)) lcd_BFcolorsB( lcd_GREEN, lcd_WHITE);  // c.return trans colors
+	         //else     lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+         } else if (trans.status == ESTS_DOOROPEN)
+         {  // This is a door open event
+         	sprintf(buf, "         %02d:%02d:%02d %-25s %3d %2x%2x",
+            time.tm_hour, time.tm_min, time.tm_sec,
+            "DOOR OPEN IN TRANS",
+            trans.duration,
+            (int) trans.status, (int) trans.flags );
+            lcd_BFcolorsB( lcd_MAGENTA, lcd_WHITE);
+         } else if (trans.status == ESTS_MANPURGE)
+         {  // This is a manual purge event
+         	sprintf(buf, "%02d/%02d/%02d %02d:%02d:%02d %-25s %3d %2x%2x",
+            time.tm_mon, time.tm_mday, time.tm_year%100, time.tm_hour, time.tm_min, time.tm_sec,
+            "MANUAL PURGE",
+            trans.duration,
+            (int) trans.status, (int) trans.flags );
+	      	lcd_BFcolorsB( lcd_BLUE, lcd_WHITE);
+         } else if (trans.status == ESTS_AUTOPURGE)
+         {  // This is an automatic purge event
+         	sprintf(buf, "%02d/%02d/%02d %02d:%02d:%02d %-25s %3d %2x%2x",
+            time.tm_mon, time.tm_mday, time.tm_year%100, time.tm_hour, time.tm_min, time.tm_sec,
+            "AUTOMATIC PURGE",
+            trans.duration,
+            (int) trans.status, (int) trans.flags );
+	      	lcd_BFcolorsB( lcd_BLUE, lcd_WHITE);
+         } else if (trans.status == ESTS_SECURE_REMOVAL)
+         {  // This is a secure transaction removal event
+	         //   sprintf(buf, "%02d/%02d/%02d %02d:%02d:%02d %-11s %-10s %6ld %2x%2x",
+	         //   time.tm_mon, time.tm_mday, time.tm_year%100, time.tm_hour, time.tm_min, time.tm_sec,
+	         //   trans.flags < SYSTEM_NAME ? param.station_name[trans.flags].name : "??",
+	         //   "SECURE ID",
+	         //   (* (unsigned long*) &trans.duration) - CARDBASE,
+	         //   (int) trans.status, (int) trans.flags );
+            UID[0] = (char) trans.duration >> 8;
+            UID[1] = (char) trans.duration && 0xFF;
+            UID[2] = trans.source_sta;
+            UID[3] = trans.dest_sta;
+            UID[4] = trans.flags;
+            UID_Decode(UID, UIDstr);
+         	sprintf(buf, "%02d/%02d/%02d %02d:%02d:%02d %-10s %-12s",
+            time.tm_mon, time.tm_mday, time.tm_year%100, time.tm_hour, time.tm_min, time.tm_sec,
+            "SECURE ID", UIDstr);
+	      	lcd_BFcolorsD( 0xAA0, 0xFFF);
+         } else
+         {  // unknown entry type
+         	sprintf(buf, "%02d/%02d/%02d %02d:%02d:%02d %-25s %3d %2x%2x",
+            time.tm_mon, time.tm_mday, time.tm_year%100, time.tm_hour, time.tm_min, time.tm_sec,
+            "UNKNOWN STATUS",
+            trans.duration,
+            (int) trans.status, (int) trans.flags );
+	      	lcd_BFcolorsB( lcd_GREY, lcd_WHITE);
+         }
+         // Display record unless it is blank or supressed by format
+		   if (trans.status != ESTS_BLANK)
+         {  if ((format==0) || (trans.status>0 && trans.status<LAST_TRANS_EVENT))
+         	{  // ok to show
+               lcd_DispText(buf, x, y, MODE_NORMAL);
+		         y+=dy;
+               j++;
+            }
+         }
+      }
+      entry--;
+   }
+   if (j < TRANS_PER_PAGE)
+   {  // clear the rest of the work area
+	   lcd_BFcolorsB( lcd_WHITE, lcd_WHITE);
+	   lcd_Rectangle(1, y, 320, 204, 1);    // fill left side progress
+	   lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+	}
+   lcd_showPage(page+1, lastPage+1);
+}
+void lcd_showTransSummary()
+{
+   // uses structure statistics  :  system summary statistics
+
+   char myline[80];     // line to send to the lcd
+   char * instr;        // work pointer into myline
+   long subtot;         // total of transactions or alarms
+   int button;
+
+   button=0;
+   while ( (button != BTN_EXIT) && !secTimeout(menu_timeout) )
+   {
+	   lcd_drawScreen(5, "SUMMARY LOG");
+	   lcd_ButtonDef( BTN_CANCEL,
+		      BTN_TXTOFFSET, 9, 9,
+	         BTN_TLXY, 8, 280,             // starting x,y for buttons
+	         BTN_TEXT, "Reset",
+	         BTN_END );
+
+	   lcd_Font("8x12");
+	   lcd_DispText(param.stationName, 10, 50, MODE_NORMAL);
+	   lcd_DispText("\nTRANSACTIONS:", 0, 0, MODE_NORMAL);
+	   sprintf(myline, "\nIncoming:             %ld", statistics.trans_in);
+	   lcd_DispText(myline, 0, 0, MODE_NORMAL);
+	   sprintf(myline, "\nOutgoing:             %ld", statistics.trans_out);
+	   lcd_DispText(myline, 0, 0, MODE_NORMAL);
+	   sprintf(myline, "\nTotal Transactions:   %ld", statistics.trans_in + statistics.trans_out);
+	   lcd_DispText(myline, 0, 0, MODE_NORMAL);
+	   //sprintf(myline, "\n    Grand Total:           %ld", transactionCount());
+	   //lcd_DispText(myline, 0, 0, MODE_NORMAL);
+	   lcd_DispText("\n\nALARMS", 0, 0, MODE_NORMAL);
+	   sprintf(myline, "\nDoor Open During Use: %d", statistics.door_alarm);
+	   lcd_DispText(myline, 0, 0, MODE_NORMAL);
+//	   sprintf(myline, "\nIncomplete Delivery:  %d", statistics.deliv_alarm);
+//	   lcd_DispText(myline, 0, 0, MODE_NORMAL);
+	   //sprintf(myline, "\nDiverter Timeout:     %d", statistics.divert_alarm);
+	   //lcd_DispText(myline, 0, 0, MODE_NORMAL);
+//	   sprintf(myline, "\nCarrier Lift Timeout: %d", statistics.cic_lift_alarm);
+// 	   lcd_DispText(myline, 0, 0, MODE_NORMAL);
+	   //subtot=statistics.deliv_alarm+statistics.divert_alarm+statistics.cic_lift_alarm;
+//	   subtot=statistics.deliv_alarm+statistics.cic_lift_alarm;
+//	   sprintf(myline, "\nTotal Alarms:         %ld", subtot);
+//	   lcd_DispText(myline, 0, 0, MODE_NORMAL);
+
+	   // wait for any button
+	   menu_timeout = SEC_TIMER + 60;
+	   while(((button=lcd_GetTouch(100)) == -1) && !secTimeout(menu_timeout) ) maintenance();
+      if (button==BTN_CANCEL)
+      {  // Ask: Are You Sure?
+      	lcd_Font("16B");
+         lcd_BFcolorsB( lcd_LGREY, lcd_LGREY);  // unfill color
+         lcd_Rectangle(20, 100, 220, 160, 1);    // fill white
+         lcd_BFcolorsB( lcd_BLACK, lcd_WHITE);
+         lcd_Rectangle(20, 100, 220, 160, 0);    // outline
+         lcd_DispText("Press Reset again to confirm\nor Exit to cancel", 30, 115, MODE_TRANS);
+
+	      menu_timeout = SEC_TIMER + 60;
+		   while(((button=lcd_GetTouch(100)) == -1) && !secTimeout(menu_timeout) ) maintenance();
+         if (button==BTN_CANCEL)
+         {  // OK to reset
+         	resetStatistics();
+         }
+         else button=0; // don't really exit, just repaint the screen
+      }
+   }
+
+}
+
+
+unsigned long transaction_count;
+static unsigned long transCountXaddr;			// physical memory address
+/*******************************************************/
+unsigned long transactionCount() { return transaction_count; }
+/*******************************************************/
+nodebug void incrementCounter()
+{
+   transaction_count++;
+   //setCountMessage();
+   root2xmem( transCountXaddr, &transaction_count, 4);
+   //root2xmem( transCountXaddr+4, &statistics, sizeof(statistics));  // also save stats to xmem
+   //syncTransCount(); // send to the slave
+}
+
+/*******************************************************/
+void loadTransactionCount()
+{
+	#GLOBAL_INIT
+   {	transCountXaddr = 0; }
+
+   // allocate xmem if not already done
+   if (transCountXaddr == 0) transCountXaddr = xalloc(32);
+
+   // Read transaction counter
+   xmem2root( &transaction_count, transCountXaddr, 4);
+   //xmem2root( &statistics, transCountXaddr+4, sizeof(statistics));  // also read stats
+
+   if (transaction_count < 0 || transaction_count > 10000000)
+   { resetTransactionCount(0); }
+
+   //setCountMessage();
+   //syncTransCount(); // send to the slave
+}
+/******************************************************************/
+void resetTransactionCount(unsigned long value)
+{  transaction_count=value;
+   //setCountMessage();
+   root2xmem( transCountXaddr, &transaction_count, 4);
+   //syncTransCount(); // send to the slave
+}
+void resetStatistics()
+{
+   // reset system statistics
+   statistics.trans_in=0;
+   statistics.trans_out=0;
+   statistics.deliv_alarm=0;
+   statistics.divert_alarm=0;
+   statistics.cic_lift_alarm=0;
+   statistics.door_alarm=0;
 }
 
